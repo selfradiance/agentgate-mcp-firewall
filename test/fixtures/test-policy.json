@@ -1,0 +1,13 @@
+{
+  "tools": {
+    "echo": {
+      "tier": "low",
+      "exposure_cents": 100
+    },
+    "add": {
+      "tier": "medium",
+      "exposure_cents": 500
+    }
+  },
+  "default_exposure_cents": 200
+}
