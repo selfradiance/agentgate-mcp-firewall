@@ -72,6 +72,8 @@ export interface FirewallServerOptions {
 }
 
 interface SessionAuth {
+  /** When true, an authenticate call is in progress but not yet confirmed. */
+  pending?: boolean;
   identityId: string;
   bondId: string;
   authenticatedAt: number;
@@ -251,7 +253,8 @@ export class FirewallServer {
       // Gate upstream tools behind authentication
       if (this.authRequired) {
         const sessionId = transport.sessionId;
-        if (!sessionId || !this.sessionAuth.has(sessionId)) {
+        const session = sessionId ? this.sessionAuth.get(sessionId) : undefined;
+        if (!sessionId || !session || session.pending) {
           return {
             content: [
               {
@@ -264,7 +267,6 @@ export class FirewallServer {
         }
 
         // AUDIT FIX (Finding 5): Re-verify identity if session auth has expired.
-        const session = this.sessionAuth.get(sessionId)!;
         const elapsed = Date.now() - session.authenticatedAt;
         if (elapsed > this.sessionTtlMs) {
           // Session expired — re-verify identity on AgentGate
@@ -455,25 +457,37 @@ export class FirewallServer {
       };
     }
 
-    // AUDIT FIX (Finding 4): Reject re-authentication on an already-authenticated session.
-    // Prevents identity rebinding mid-session.
+    // AUDIT FIX (Finding 4 + Round 4 Finding 1): Reject if session already has an entry
+    // (either pending or authenticated). The pending marker closes the TOCTOU race —
+    // the first authenticate call claims the slot synchronously before any async work.
     if (this.sessionAuth.has(sessionId)) {
       return {
         content: [
           {
             type: "text",
-            text: "This session is already authenticated. Re-authentication is not permitted. Open a new session to authenticate with a different identity.",
+            text: "This session is already authenticated or authentication is in progress. Re-authentication is not permitted. Open a new session to authenticate with a different identity.",
           },
         ],
         isError: true,
       };
     }
 
+    // Claim the session slot immediately (synchronous) to prevent concurrent
+    // authenticate calls from racing past the has() check above.
+    this.sessionAuth.set(sessionId, {
+      pending: true,
+      identityId,
+      bondId,
+      authenticatedAt: 0,
+    });
+
     // Verify the identity exists on AgentGate
     let identitySummary;
     try {
       identitySummary = await this.agentgateClient!.checkIdentity(identityId);
     } catch (error) {
+      // Verification failed — release the pending slot
+      this.sessionAuth.delete(sessionId);
       const message =
         error instanceof Error ? error.message : "Unknown error";
       return {
@@ -492,6 +506,8 @@ export class FirewallServer {
     // but we can confirm the identity has posted bonds. The specific bond will be
     // validated at execution time when AgentGate processes the bonded action.
     if (identitySummary.reputation.stats.locks === 0) {
+      // Bond check failed — release the pending slot
+      this.sessionAuth.delete(sessionId);
       return {
         content: [
           {
@@ -503,7 +519,7 @@ export class FirewallServer {
       };
     }
 
-    // Bind identity and bond to this session with a timestamp for TTL tracking
+    // Promote from pending to fully authenticated
     this.sessionAuth.set(sessionId, {
       identityId,
       bondId,
