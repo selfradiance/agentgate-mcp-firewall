@@ -201,6 +201,23 @@ export class FirewallServer {
       await transport.handleRequest(req, res);
     });
 
+    app.delete("/mcp", async (req, res) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+      if (!sessionId || !transports.has(sessionId)) {
+        res.status(404).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Session not found" },
+          id: null,
+        });
+        return;
+      }
+
+      const transport = transports.get(sessionId)!;
+      await transport.close();
+      res.status(200).end();
+    });
+
     this.httpServer = http.createServer(app);
 
     return new Promise((resolve) => {
@@ -418,9 +435,14 @@ export class FirewallServer {
       );
       return { blocked: false, actionId: result.actionId };
     } catch (error) {
-      const message =
+      const detail =
         error instanceof Error ? error.message : "Unknown error";
-      return { blocked: true, reason: message };
+      console.error(`Bonded action recording failed for tool "${toolName}": ${detail}`);
+      // Return a generic message — do not expose AgentGate internals to the client
+      const reason = detail.includes("INSUFFICIENT_BOND_CAPACITY")
+        ? "insufficient bond capacity"
+        : "bond verification failed";
+      return { blocked: true, reason };
     }
   }
 
@@ -488,13 +510,14 @@ export class FirewallServer {
     } catch (error) {
       // Verification failed — release the pending slot
       this.sessionAuth.delete(sessionId);
-      const message =
+      const detail =
         error instanceof Error ? error.message : "Unknown error";
+      console.error(`Identity verification failed for "${identityId}": ${detail}`);
       return {
         content: [
           {
             type: "text",
-            text: `Authentication failed: ${message}`,
+            text: "Authentication failed: identity could not be verified.",
           },
         ],
         isError: true,
