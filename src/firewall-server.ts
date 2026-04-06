@@ -58,6 +58,8 @@ export interface FirewallServerOptions {
   upstreamUrl: string;
   /** AgentGate client for identity verification (optional — if omitted, auth is disabled) */
   agentgateClient?: AgentGateClient;
+  /** Separate AgentGate client used to resolve actions (must be a different identity than the executor) */
+  resolverClient?: AgentGateClient;
   /** Policy config for tool risk/exposure mapping (required when agentgateClient is set) */
   policy?: PolicyConfig;
   /** Bond ID the firewall uses to record actions on AgentGate (required when agentgateClient is set) */
@@ -99,6 +101,7 @@ export class FirewallServer {
   private upstreamTools: Tool[] = [];
   private port: number;
   private agentgateClient: AgentGateClient | undefined;
+  private resolverClient: AgentGateClient | undefined;
   private policy: PolicyConfig | undefined;
   private firewallBondId: string | undefined;
   private sessionAuth = new Map<string, SessionAuth>();
@@ -107,6 +110,7 @@ export class FirewallServer {
     this.port = options.port ?? DEFAULT_PORT;
     this.upstream = new UpstreamClient({ url: options.upstreamUrl });
     this.agentgateClient = options.agentgateClient;
+    this.resolverClient = options.resolverClient;
     this.policy = options.policy;
     this.firewallBondId = options.firewallBondId;
   }
@@ -247,15 +251,85 @@ export class FirewallServer {
               isError: true,
             };
           }
+
+          // Forward to upstream, with rollback on failure
+          return this.forwardWithRollback(name, args ?? {}, gateResult.actionId);
         }
       }
 
-      // Forward to upstream
+      // Forward to upstream (no bonded action tracking)
       const result = await this.upstream.callTool(name, args ?? {});
       return result;
     });
 
     return server;
+  }
+
+  /**
+   * Forward a tool call to the upstream server with rollback on failure.
+   * If the upstream call fails, resolve the action as "failed" on AgentGate
+   * to release the bond exposure. On success, the action stays open.
+   */
+  private async forwardWithRollback(
+    toolName: string,
+    args: Record<string, unknown>,
+    actionId: string,
+  ) {
+    let result: Awaited<ReturnType<typeof this.upstream.callTool>>;
+    let failed = false;
+    let errorMessage = "";
+
+    try {
+      result = await this.upstream.callTool(toolName, args);
+
+      // Check if the upstream returned an MCP-level tool error
+      if (result.isError) {
+        failed = true;
+        const firstContent = (
+          result.content as Array<{ type: string; text?: string }>
+        )[0];
+        errorMessage = firstContent?.text ?? "Upstream tool returned an error";
+      }
+    } catch (error) {
+      // Transport/network error
+      failed = true;
+      errorMessage =
+        error instanceof Error ? error.message : "Unknown upstream error";
+      result = {
+        content: [{ type: "text", text: errorMessage }],
+        isError: true,
+      };
+    }
+
+    if (failed && this.resolverClient) {
+      // Resolve the action as "failed" to release bond exposure
+      try {
+        await this.resolverClient.resolveAction(actionId, "failed");
+      } catch (resolveError) {
+        // Log but don't block — the primary error is the upstream failure
+        const resolveMsg =
+          resolveError instanceof Error
+            ? resolveError.message
+            : "Unknown resolve error";
+        console.error(
+          `Failed to resolve action ${actionId} after upstream error: ${resolveMsg}`,
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Upstream tool call failed: ${errorMessage}. Bond exposure has been released.`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Upstream succeeded — action stays open on AgentGate.
+    // No auto-resolve; the action remains for external review/resolution.
+    return result!;
   }
 
   /**
