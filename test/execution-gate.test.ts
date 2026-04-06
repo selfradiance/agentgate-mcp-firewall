@@ -29,6 +29,11 @@ const FIREWALL_IDENTITY_PATH = path.resolve(
   "fixtures",
   "test-exec-firewall-identity.json",
 );
+const RESOLVER_IDENTITY_PATH = path.resolve(
+  import.meta.dirname,
+  "fixtures",
+  "test-exec-resolver-identity.json",
+);
 const AGENT_IDENTITY_PATH = path.resolve(
   import.meta.dirname,
   "fixtures",
@@ -73,7 +78,7 @@ describe("execution gate", () => {
     }
 
     // Clean up leftover identity files
-    for (const p of [FIREWALL_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
+    for (const p of [FIREWALL_IDENTITY_PATH, RESOLVER_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
       if (existsSync(p)) unlinkSync(p);
     }
 
@@ -94,6 +99,14 @@ describe("execution gate", () => {
       "MCP firewall execution gate test",
     );
     firewallBondId = firewallBond.bondId;
+
+    // Create resolver identity (required by fail-closed validation)
+    const resolverClient = new AgentGateClient({
+      agentgateUrl: AGENTGATE_URL,
+      identityPath: RESOLVER_IDENTITY_PATH,
+      apiKey: API_KEY,
+    });
+    await resolverClient.registerIdentity();
 
     // Create a separate agent identity and lock a bond for it
     const agentClient = new AgentGateClient({
@@ -117,11 +130,12 @@ describe("execution gate", () => {
     const echo = await startEchoServer(ECHO_PORT);
     echoHttpServer = echo.server;
 
-    // Start the firewall with AgentGate client, policy, and firewall bond
+    // Start the firewall with all governance components (all required by fail-closed validation)
     firewall = new FirewallServer({
       port: FIREWALL_PORT,
       upstreamUrl: echo.url,
       agentgateClient: firewallAgClient,
+      resolverClient,
       policy: TEST_POLICY,
       firewallBondId,
     });
@@ -156,7 +170,7 @@ describe("execution gate", () => {
       });
     }
 
-    for (const p of [FIREWALL_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
+    for (const p of [FIREWALL_IDENTITY_PATH, RESOLVER_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
       if (existsSync(p)) unlinkSync(p);
     }
   });

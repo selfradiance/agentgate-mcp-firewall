@@ -133,9 +133,9 @@ export class FirewallServer {
     // AUDIT FIX (Finding 1): Fail-closed — refuse to start when agentgateClient
     // is provided but policy or firewallBondId are missing. Without both, the
     // economic accountability layer would be silently bypassed.
-    if (this.agentgateClient && (!this.policy || !this.firewallBondId)) {
+    if (this.agentgateClient && (!this.policy || !this.firewallBondId || !this.resolverClient)) {
       throw new Error(
-        "Firewall misconfiguration: when agentgateClient is provided, both 'policy' and 'firewallBondId' are required. " +
+        "Firewall misconfiguration: when agentgateClient is provided, 'policy', 'firewallBondId', and 'resolverClient' are all required. " +
         "The firewall refuses to start without full governance configuration (fail-closed).",
       );
     }

@@ -27,6 +27,11 @@ const FIREWALL_IDENTITY_PATH = path.resolve(
   "fixtures",
   "test-auth-firewall-identity.json",
 );
+const RESOLVER_IDENTITY_PATH = path.resolve(
+  import.meta.dirname,
+  "fixtures",
+  "test-auth-resolver-identity.json",
+);
 const AGENT_IDENTITY_PATH = path.resolve(
   import.meta.dirname,
   "fixtures",
@@ -71,7 +76,7 @@ describe("authenticate tool", () => {
     }
 
     // Clean up leftover identity files
-    for (const p of [FIREWALL_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
+    for (const p of [FIREWALL_IDENTITY_PATH, RESOLVER_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
       if (existsSync(p)) unlinkSync(p);
     }
 
@@ -92,6 +97,14 @@ describe("authenticate tool", () => {
       "MCP firewall auth test - firewall bond",
     );
     firewallBondId = firewallBond.bondId;
+
+    // Create resolver identity (required by fail-closed validation)
+    const resolverClient = new AgentGateClient({
+      agentgateUrl: AGENTGATE_URL,
+      identityPath: RESOLVER_IDENTITY_PATH,
+      apiKey: API_KEY,
+    });
+    await resolverClient.registerIdentity();
 
     // Create a separate "agent" identity that will authenticate through the firewall
     const agentClient = new AgentGateClient({
@@ -117,11 +130,12 @@ describe("authenticate tool", () => {
     const echo = await startEchoServer(ECHO_PORT);
     echoHttpServer = echo.server;
 
-    // Start the firewall with the AgentGate client, policy, and bond (all required)
+    // Start the firewall with all governance components (all required by fail-closed validation)
     firewall = new FirewallServer({
       port: FIREWALL_PORT,
       upstreamUrl: echo.url,
       agentgateClient: firewallAgClient,
+      resolverClient,
       policy: AUTH_TEST_POLICY,
       firewallBondId,
     });
@@ -147,7 +161,7 @@ describe("authenticate tool", () => {
     }
 
     // Clean up identity files
-    for (const p of [FIREWALL_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
+    for (const p of [FIREWALL_IDENTITY_PATH, RESOLVER_IDENTITY_PATH, AGENT_IDENTITY_PATH]) {
       if (existsSync(p)) unlinkSync(p);
     }
   });
