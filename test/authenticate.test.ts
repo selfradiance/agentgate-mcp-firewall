@@ -16,6 +16,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { startEchoServer } from "./fixtures/echo-server.js";
 import { FirewallServer } from "../src/firewall-server.js";
 import { AgentGateClient } from "../src/agentgate-client.js";
+import type { PolicyConfig } from "../src/policy.js";
 
 const AGENTGATE_URL = "http://127.0.0.1:3000";
 const API_KEY = process.env.AGENTGATE_REST_KEY ?? "testkey123";
@@ -31,6 +32,15 @@ const AGENT_IDENTITY_PATH = path.resolve(
   "fixtures",
   "test-auth-agent-identity.json",
 );
+
+// Low exposure values to fit within Tier 1 bond cap (100 cents) with 1.2x multiplier
+const AUTH_TEST_POLICY: PolicyConfig = {
+  tools: {
+    echo: { tier: "low", exposure_cents: 10 },
+    add: { tier: "medium", exposure_cents: 10 },
+  },
+  default_exposure_cents: 10,
+};
 
 async function isAgentGateRunning(): Promise<boolean> {
   try {
@@ -48,6 +58,7 @@ describe("authenticate tool", () => {
   let running: boolean;
   let agentIdentityId: string;
   let bondId: string;
+  let firewallBondId: string;
 
   beforeAll(async () => {
     running = await isAgentGateRunning();
@@ -71,6 +82,16 @@ describe("authenticate tool", () => {
       apiKey: API_KEY,
     });
     await firewallAgClient.registerIdentity();
+
+    // Lock a bond for the firewall identity (required by fail-closed validation)
+    const firewallBond = await firewallAgClient.lockBond(
+      firewallAgClient.identityId!,
+      100,
+      "USD",
+      3600,
+      "MCP firewall auth test - firewall bond",
+    );
+    firewallBondId = firewallBond.bondId;
 
     // Create a separate "agent" identity that will authenticate through the firewall
     const agentClient = new AgentGateClient({
@@ -96,11 +117,13 @@ describe("authenticate tool", () => {
     const echo = await startEchoServer(ECHO_PORT);
     echoHttpServer = echo.server;
 
-    // Start the firewall with the AgentGate client (auth enabled)
+    // Start the firewall with the AgentGate client, policy, and bond (all required)
     firewall = new FirewallServer({
       port: FIREWALL_PORT,
       upstreamUrl: echo.url,
       agentgateClient: firewallAgClient,
+      policy: AUTH_TEST_POLICY,
+      firewallBondId,
     });
     await firewall.start();
 

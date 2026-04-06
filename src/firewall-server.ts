@@ -27,6 +27,9 @@ import { getExposure } from "./policy.js";
 
 const MAX_PAYLOAD_BYTES = 4000;
 
+/** Default session auth TTL: 5 minutes. After this, the firewall re-verifies the identity. */
+const DEFAULT_SESSION_TTL_MS = 5 * 60 * 1000;
+
 /**
  * Sanitize a payload object to stay under the byte limit.
  * If the full payload is too large, truncate the arguments field.
@@ -64,11 +67,14 @@ export interface FirewallServerOptions {
   policy?: PolicyConfig;
   /** Bond ID the firewall uses to record actions on AgentGate (required when agentgateClient is set) */
   firewallBondId?: string;
+  /** Session auth TTL in milliseconds (default: 5 minutes). After expiry, identity is re-verified. */
+  sessionTtlMs?: number;
 }
 
 interface SessionAuth {
   identityId: string;
   bondId: string;
+  authenticatedAt: number;
 }
 
 const DEFAULT_PORT = 5555;
@@ -104,6 +110,7 @@ export class FirewallServer {
   private resolverClient: AgentGateClient | undefined;
   private policy: PolicyConfig | undefined;
   private firewallBondId: string | undefined;
+  private sessionTtlMs: number;
   private sessionAuth = new Map<string, SessionAuth>();
 
   constructor(private options: FirewallServerOptions) {
@@ -113,6 +120,7 @@ export class FirewallServer {
     this.resolverClient = options.resolverClient;
     this.policy = options.policy;
     this.firewallBondId = options.firewallBondId;
+    this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
   }
 
   /** Whether authentication is required (AgentGate client was provided). */
@@ -122,6 +130,16 @@ export class FirewallServer {
 
   /** Start the firewall: connect to upstream, discover tools, listen for clients. */
   async start(): Promise<{ url: string }> {
+    // AUDIT FIX (Finding 1): Fail-closed — refuse to start when agentgateClient
+    // is provided but policy or firewallBondId are missing. Without both, the
+    // economic accountability layer would be silently bypassed.
+    if (this.agentgateClient && (!this.policy || !this.firewallBondId)) {
+      throw new Error(
+        "Firewall misconfiguration: when agentgateClient is provided, both 'policy' and 'firewallBondId' are required. " +
+        "The firewall refuses to start without full governance configuration (fail-closed).",
+      );
+    }
+
     // Connect to the upstream MCP server and discover its tools
     await this.upstream.connect();
     this.upstreamTools = await this.upstream.listTools();
@@ -211,6 +229,20 @@ export class FirewallServer {
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
 
+      // AUDIT FIX (Finding 8): Explicitly reject calls to "authenticate" when auth is disabled.
+      // Without this, the call would fall through to upstream forwarding.
+      if (name === "authenticate" && !this.authRequired) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Authentication is not enabled on this firewall. The 'authenticate' tool is not available.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
       // Handle the authenticate tool
       if (name === "authenticate" && this.authRequired) {
         return this.handleAuthenticate(transport, args ?? {});
@@ -231,33 +263,53 @@ export class FirewallServer {
           };
         }
 
-        // Record the bonded action on AgentGate before forwarding
-        // (only when policy and firewall bond are configured)
-        if (this.policy && this.firewallBondId) {
-          const session = this.sessionAuth.get(sessionId)!;
-          const gateResult = await this.recordBondedAction(
-            name,
-            args ?? {},
-            session,
-          );
-          if (gateResult.blocked) {
+        // AUDIT FIX (Finding 5): Re-verify identity if session auth has expired.
+        const session = this.sessionAuth.get(sessionId)!;
+        const elapsed = Date.now() - session.authenticatedAt;
+        if (elapsed > this.sessionTtlMs) {
+          // Session expired — re-verify identity on AgentGate
+          try {
+            await this.agentgateClient!.checkIdentity(session.identityId);
+            // Refresh the timestamp
+            session.authenticatedAt = Date.now();
+          } catch {
+            // Identity no longer valid — clear session and reject
+            this.sessionAuth.delete(sessionId);
             return {
               content: [
                 {
                   type: "text",
-                  text: `Tool call blocked: ${gateResult.reason}`,
+                  text: "Session expired and identity re-verification failed. Please authenticate again.",
                 },
               ],
               isError: true,
             };
           }
-
-          // Forward to upstream, with rollback on failure
-          return this.forwardWithRollback(name, args ?? {}, gateResult.actionId);
         }
+
+        // Record the bonded action on AgentGate before forwarding
+        const gateResult = await this.recordBondedAction(
+          name,
+          args ?? {},
+          session,
+        );
+        if (gateResult.blocked) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Tool call blocked: ${gateResult.reason}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+
+        // Forward to upstream, with rollback on failure
+        return this.forwardWithRollback(name, args ?? {}, gateResult.actionId);
       }
 
-      // Forward to upstream (no bonded action tracking)
+      // Forward to upstream (auth not enabled)
       const result = await this.upstream.callTool(name, args ?? {});
       return result;
     });
@@ -390,9 +442,34 @@ export class FirewallServer {
       };
     }
 
+    const sessionId = transport.sessionId;
+    if (!sessionId) {
+      return {
+        content: [
+          { type: "text", text: "Internal error: no session ID available." },
+        ],
+        isError: true,
+      };
+    }
+
+    // AUDIT FIX (Finding 4): Reject re-authentication on an already-authenticated session.
+    // Prevents identity rebinding mid-session.
+    if (this.sessionAuth.has(sessionId)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "This session is already authenticated. Re-authentication is not permitted. Open a new session to authenticate with a different identity.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
     // Verify the identity exists on AgentGate
+    let identitySummary;
     try {
-      await this.agentgateClient!.checkIdentity(identityId);
+      identitySummary = await this.agentgateClient!.checkIdentity(identityId);
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown error";
@@ -407,18 +484,28 @@ export class FirewallServer {
       };
     }
 
-    // Bind identity and bond to this session
-    const sessionId = transport.sessionId;
-    if (!sessionId) {
+    // AUDIT FIX (Finding 3): Validate that the identity has at least one active bond.
+    // We cannot verify the specific bondId without a bond GET endpoint on AgentGate,
+    // but we can confirm the identity has posted bonds. The specific bond will be
+    // validated at execution time when AgentGate processes the bonded action.
+    if (identitySummary.reputation.stats.locks === 0) {
       return {
         content: [
-          { type: "text", text: "Internal error: no session ID available." },
+          {
+            type: "text",
+            text: "Authentication failed: this identity has no bonds on AgentGate. Lock a bond before authenticating.",
+          },
         ],
         isError: true,
       };
     }
 
-    this.sessionAuth.set(sessionId, { identityId, bondId });
+    // Bind identity and bond to this session with a timestamp for TTL tracking
+    this.sessionAuth.set(sessionId, {
+      identityId,
+      bondId,
+      authenticatedAt: Date.now(),
+    });
 
     return {
       content: [
