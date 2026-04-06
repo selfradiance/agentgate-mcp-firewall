@@ -22,6 +22,34 @@ import {
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { UpstreamClient } from "./upstream-client.js";
 import type { AgentGateClient } from "./agentgate-client.js";
+import type { PolicyConfig } from "./policy.js";
+import { getExposure } from "./policy.js";
+
+const MAX_PAYLOAD_BYTES = 4000;
+
+/**
+ * Sanitize a payload object to stay under the byte limit.
+ * If the full payload is too large, truncate the arguments field.
+ */
+function sanitizePayload(payload: Record<string, unknown>): Record<string, unknown> {
+  const serialized = JSON.stringify(payload);
+  if (Buffer.byteLength(serialized, "utf-8") <= MAX_PAYLOAD_BYTES) {
+    return payload;
+  }
+
+  // Truncate the arguments to fit
+  const withoutArgs = { ...payload, arguments: "[truncated]" };
+  const overhead = Buffer.byteLength(JSON.stringify(withoutArgs), "utf-8");
+  const budget = MAX_PAYLOAD_BYTES - overhead;
+
+  if (budget > 20) {
+    const argsStr = JSON.stringify(payload.arguments);
+    const truncated = argsStr.slice(0, budget - 15) + "...[truncated]";
+    return { ...payload, arguments: truncated };
+  }
+
+  return withoutArgs;
+}
 
 export interface FirewallServerOptions {
   /** Port the firewall listens on */
@@ -30,6 +58,10 @@ export interface FirewallServerOptions {
   upstreamUrl: string;
   /** AgentGate client for identity verification (optional — if omitted, auth is disabled) */
   agentgateClient?: AgentGateClient;
+  /** Policy config for tool risk/exposure mapping (required when agentgateClient is set) */
+  policy?: PolicyConfig;
+  /** Bond ID the firewall uses to record actions on AgentGate (required when agentgateClient is set) */
+  firewallBondId?: string;
 }
 
 interface SessionAuth {
@@ -67,12 +99,16 @@ export class FirewallServer {
   private upstreamTools: Tool[] = [];
   private port: number;
   private agentgateClient: AgentGateClient | undefined;
+  private policy: PolicyConfig | undefined;
+  private firewallBondId: string | undefined;
   private sessionAuth = new Map<string, SessionAuth>();
 
   constructor(private options: FirewallServerOptions) {
     this.port = options.port ?? DEFAULT_PORT;
     this.upstream = new UpstreamClient({ url: options.upstreamUrl });
     this.agentgateClient = options.agentgateClient;
+    this.policy = options.policy;
+    this.firewallBondId = options.firewallBondId;
   }
 
   /** Whether authentication is required (AgentGate client was provided). */
@@ -190,6 +226,28 @@ export class FirewallServer {
             isError: true,
           };
         }
+
+        // Record the bonded action on AgentGate before forwarding
+        // (only when policy and firewall bond are configured)
+        if (this.policy && this.firewallBondId) {
+          const session = this.sessionAuth.get(sessionId)!;
+          const gateResult = await this.recordBondedAction(
+            name,
+            args ?? {},
+            session,
+          );
+          if (gateResult.blocked) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Tool call blocked: ${gateResult.reason}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        }
       }
 
       // Forward to upstream
@@ -198,6 +256,44 @@ export class FirewallServer {
     });
 
     return server;
+  }
+
+  /**
+   * Record a bonded action on AgentGate before forwarding a tool call.
+   * Returns { blocked: false } on success, or { blocked: true, reason } on failure.
+   */
+  private async recordBondedAction(
+    toolName: string,
+    args: Record<string, unknown>,
+    session: SessionAuth,
+  ): Promise<{ blocked: false; actionId: string } | { blocked: true; reason: string }> {
+    const exposureCents = getExposure(this.policy!, toolName);
+    const tier = this.policy!.tools[toolName]?.tier ?? "default";
+
+    // Build the action payload with key context, sanitized to stay under 4000 bytes
+    const payload = sanitizePayload({
+      upstreamUrl: this.options.upstreamUrl,
+      toolName,
+      arguments: args,
+      timestamp: new Date().toISOString(),
+      tier,
+      agentIdentityId: session.identityId,
+      agentBondId: session.bondId,
+    });
+
+    try {
+      const result = await this.agentgateClient!.executeBondedAction(
+        this.firewallBondId!,
+        "mcp.tool_call",
+        payload,
+        exposureCents,
+      );
+      return { blocked: false, actionId: result.actionId };
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Unknown error";
+      return { blocked: true, reason: message };
+    }
   }
 
   /** Handle the authenticate tool call. */
