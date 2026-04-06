@@ -49,6 +49,11 @@ export interface IdentitySummary {
   };
 }
 
+export interface BondResult {
+  bondId: string;
+  status: string;
+}
+
 export interface ActionResult {
   actionId: string;
   status: string;
@@ -149,6 +154,36 @@ export class AgentGateClient {
     }
 
     return (await response.json()) as IdentitySummary;
+  }
+
+  /**
+   * Lock a bond on AgentGate for a given identity.
+   */
+  async lockBond(
+    identityId: string,
+    amountCents: number,
+    currency: string,
+    ttlSeconds: number,
+    reason: string,
+  ): Promise<BondResult> {
+    const body = {
+      identityId,
+      amountCents,
+      currency,
+      ttlSeconds,
+      reason,
+    };
+
+    const response = await this.signedFetch("POST", "/v1/bonds/lock", body);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Failed to lock bond on AgentGate: ${response.status} ${text}`,
+      );
+    }
+
+    return (await response.json()) as BondResult;
   }
 
   /**
