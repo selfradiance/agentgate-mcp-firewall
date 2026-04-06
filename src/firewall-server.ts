@@ -427,15 +427,18 @@ export class FirewallServer {
     transport: StreamableHTTPServerTransport,
     args: Record<string, unknown>,
   ) {
-    const identityId = args.identityId as string | undefined;
-    const bondId = args.bondId as string | undefined;
+    const identityId = args.identityId;
+    const bondId = args.bondId;
 
-    if (!identityId || !bondId) {
+    if (
+      typeof identityId !== "string" || identityId.length === 0 ||
+      typeof bondId !== "string" || bondId.length === 0
+    ) {
       return {
         content: [
           {
             type: "text",
-            text: "Both identityId and bondId are required.",
+            text: "Both identityId and bondId are required and must be non-empty strings.",
           },
         ],
         isError: true,

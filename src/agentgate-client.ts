@@ -19,6 +19,19 @@ import {
 const DEFAULT_AGENTGATE_URL = "http://127.0.0.1:3000";
 const DEFAULT_IDENTITY_PATH = "./agent-identity-firewall.json";
 
+/**
+ * Validate that a value is safe to interpolate into a URL path segment.
+ * Rejects path separators, traversal sequences, and non-string types.
+ */
+function validatePathSegment(value: unknown, label: string): void {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${label} must be a non-empty string`);
+  }
+  if (value.includes("/") || value.includes("\\") || value.includes("..")) {
+    throw new Error(`${label} contains invalid characters`);
+  }
+}
+
 export interface AgentGateClientOptions {
   /** AgentGate base URL (default: http://127.0.0.1:3000) */
   agentgateUrl?: string;
@@ -144,6 +157,7 @@ export class AgentGateClient {
    * The reputation stats can be used to assess whether the identity is trustworthy.
    */
   async checkIdentity(identityId: string): Promise<IdentitySummary> {
+    validatePathSegment(identityId, "identityId");
     const response = await fetch(`${this.baseUrl}/v1/identities/${identityId}`);
 
     if (!response.ok) {
@@ -230,6 +244,7 @@ export class AgentGateClient {
     actionId: string,
     outcome: "success" | "failed" | "malicious",
   ): Promise<ResolveResult> {
+    validatePathSegment(actionId, "actionId");
     if (!this.keyPair?.identityId) {
       throw new Error("Identity not registered. Call registerIdentity() first.");
     }
