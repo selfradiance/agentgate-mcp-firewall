@@ -1,0 +1,11 @@
+*PROJECT_CONTEXT.md
+project ideas.md
+process-template
+node_modules/
+.DS_Store
+.env
+.env.local
+agent-identity*.json
+data/
+dist/
+*.log
