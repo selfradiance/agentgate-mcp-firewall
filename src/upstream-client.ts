@@ -10,6 +10,23 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 
+/** Timeout for upstream MCP operations (30 seconds — tool calls may be slow). */
+const UPSTREAM_TIMEOUT_MS = 30_000;
+
+/** Race a promise against a timeout. Rejects with a clear error on expiry. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error) => { clearTimeout(timer); reject(error); },
+    );
+  });
+}
+
 export interface UpstreamClientOptions {
   /** Full URL of the upstream MCP server endpoint (e.g. "http://127.0.0.1:4444/mcp") */
   url: string;
@@ -43,7 +60,11 @@ export class UpstreamClient {
   /** Connect to the upstream MCP server. */
   async connect(): Promise<void> {
     if (this.connected) return;
-    await this.client.connect(this.transport);
+    await withTimeout(
+      this.client.connect(this.transport),
+      UPSTREAM_TIMEOUT_MS,
+      "Upstream connect",
+    );
     this.connected = true;
   }
 
@@ -52,7 +73,11 @@ export class UpstreamClient {
     if (!this.connected) {
       throw new Error("UpstreamClient is not connected. Call connect() first.");
     }
-    const result = await this.client.listTools();
+    const result = await withTimeout(
+      this.client.listTools(),
+      UPSTREAM_TIMEOUT_MS,
+      "Upstream listTools",
+    );
     return result.tools;
   }
 
@@ -64,7 +89,11 @@ export class UpstreamClient {
     if (!this.connected) {
       throw new Error("UpstreamClient is not connected. Call connect() first.");
     }
-    const result = await this.client.callTool({ name, arguments: args });
+    const result = await withTimeout(
+      this.client.callTool({ name, arguments: args }),
+      UPSTREAM_TIMEOUT_MS,
+      "Upstream callTool",
+    );
     return result as CallToolResult;
   }
 

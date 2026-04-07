@@ -19,6 +19,9 @@ import {
 const DEFAULT_AGENTGATE_URL = "http://127.0.0.1:3000";
 const DEFAULT_IDENTITY_PATH = "./agent-identity-firewall.json";
 
+/** Timeout for all outbound HTTP calls to AgentGate (10 seconds). */
+const AGENTGATE_TIMEOUT_MS = 10_000;
+
 /**
  * Validate that a value is safe to interpolate into a URL path segment.
  * Rejects path separators, traversal sequences, and non-string types.
@@ -158,7 +161,16 @@ export class AgentGateClient {
    */
   async checkIdentity(identityId: string): Promise<IdentitySummary> {
     validatePathSegment(identityId, "identityId");
-    const response = await fetch(`${this.baseUrl}/v1/identities/${identityId}`);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), AGENTGATE_TIMEOUT_MS);
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}/v1/identities/${identityId}`, {
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     if (!response.ok) {
       const text = await response.text();
@@ -303,11 +315,19 @@ export class AgentGateClient {
       headers["x-agentgate-key"] = this.apiKey;
     }
 
-    return fetch(`${this.baseUrl}${path}`, {
-      method,
-      headers,
-      body: JSON.stringify(body),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), AGENTGATE_TIMEOUT_MS);
+    try {
+      return await fetch(`${this.baseUrl}${path}`, {
+        method,
+        headers,
+        body: JSON.stringify(body),
+        signal: controller.signal,
+        redirect: "error",
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**
