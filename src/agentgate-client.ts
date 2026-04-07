@@ -7,13 +7,17 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import {
   createHash,
   generateKeyPairSync,
   createPrivateKey,
   sign,
 } from "node:crypto";
+import {
+  buildAuthenticationAction,
+  type AuthenticateToolArguments,
+} from "./authentication.js";
 
 const DEFAULT_AGENTGATE_URL = "http://127.0.0.1:3000";
 const DEFAULT_IDENTITY_PATH = "./agent-identity-firewall.json";
@@ -108,6 +112,45 @@ export class AgentGateClient {
   /** Get the public key. */
   get publicKey(): string | undefined {
     return this.keyPair?.publicKey;
+  }
+
+  /**
+   * Build the signed arguments required by the firewall's authenticate tool.
+   * The signature proves the caller owns the claimed identity and bond.
+   */
+  createAuthenticationArguments(
+    identityId: string,
+    bondId: string,
+    sessionId: string,
+  ): AuthenticateToolArguments {
+    if (!this.keyPair?.identityId) {
+      throw new Error("Identity not registered. Call registerIdentity() first.");
+    }
+
+    if (identityId !== this.keyPair.identityId) {
+      throw new Error(
+        `Identity mismatch: signer is registered as ${this.keyPair.identityId}, not ${identityId}.`,
+      );
+    }
+
+    const nonce = randomUUID();
+    const timestamp = String(Date.now());
+    const body = buildAuthenticationAction(identityId, bondId, sessionId);
+    const signature = this.signRequest(
+      nonce,
+      "POST",
+      "/v1/actions/execute",
+      timestamp,
+      body,
+    );
+
+    return {
+      identityId,
+      bondId,
+      nonce,
+      timestamp,
+      signature,
+    };
   }
 
   /**
@@ -282,6 +325,43 @@ export class AgentGateClient {
   }
 
   /**
+   * Reserve a lightweight authentication action on behalf of a client identity.
+   * The request must already be signed by the caller that owns the identity.
+   */
+  async reserveAuthenticationBond(
+    args: AuthenticateToolArguments,
+    sessionId: string,
+  ): Promise<ActionResult> {
+    const body = buildAuthenticationAction(args.identityId, args.bondId, sessionId);
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      "x-nonce": args.nonce,
+      "x-agentgate-timestamp": args.timestamp,
+      "x-agentgate-signature": args.signature,
+    };
+
+    if (this.apiKey) {
+      headers["x-agentgate-key"] = this.apiKey;
+    }
+
+    const response = await this.fetchWithTimeout("/v1/actions/execute", {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      redirect: "error",
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(
+        `Failed to reserve authentication bond on AgentGate: ${response.status} ${text}`,
+      );
+    }
+
+    return (await response.json()) as ActionResult;
+  }
+
+  /**
    * Make a signed HTTP request to AgentGate.
    */
   private async signedFetch(
@@ -314,15 +394,24 @@ export class AgentGateClient {
       headers["x-agentgate-key"] = this.apiKey;
     }
 
+    return this.fetchWithTimeout(path, {
+      method,
+      headers,
+      body: JSON.stringify(body),
+      redirect: "error",
+    });
+  }
+
+  private async fetchWithTimeout(
+    path: string,
+    init: RequestInit,
+  ): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), AGENTGATE_TIMEOUT_MS);
     try {
       return await fetch(`${this.baseUrl}${path}`, {
-        method,
-        headers,
-        body: JSON.stringify(body),
+        ...init,
         signal: controller.signal,
-        redirect: "error",
       });
     } finally {
       clearTimeout(timer);
@@ -412,6 +501,11 @@ export class AgentGateClient {
    * Save keypair to the identity file.
    */
   private saveKeyPair(keyPair: IdentityKeyPair): void {
-    writeFileSync(this.identityPath, JSON.stringify(keyPair, null, 2) + "\n");
+    writeFileSync(
+      this.identityPath,
+      JSON.stringify(keyPair, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+    chmodSync(this.identityPath, 0o600);
   }
 }

@@ -8,7 +8,10 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolResult,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 
 /** Timeout for upstream MCP operations (30 seconds — tool calls may be slow). */
 const UPSTREAM_TIMEOUT_MS = 30_000;
@@ -34,11 +37,6 @@ export interface UpstreamClientOptions {
   clientName?: string;
   /** Client version reported during MCP handshake */
   clientVersion?: string;
-}
-
-export interface CallToolResult {
-  content: Array<{ type: string; text: string }>;
-  isError?: boolean;
 }
 
 export class UpstreamClient {

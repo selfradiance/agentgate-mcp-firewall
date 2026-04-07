@@ -79,6 +79,7 @@ describe("end-to-end", () => {
   let echoHttpServer: http.Server;
   let firewall: FirewallServer;
   let client: Client;
+  let transport: StreamableHTTPClientTransport;
   let running: boolean;
 
   // AgentGate clients
@@ -165,7 +166,7 @@ describe("end-to-end", () => {
 
     // 7. Connect a test MCP client to the firewall
     client = new Client({ name: "e2e-test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(
+    transport = new StreamableHTTPClientTransport(
       new URL(`http://127.0.0.1:${FIREWALL_PORT}/mcp`),
     );
     await client.connect(transport);
@@ -195,7 +196,11 @@ describe("end-to-end", () => {
     // Authenticate with the agent's identity and bond
     const authResult = await client.callTool({
       name: "authenticate",
-      arguments: { identityId: agentIdentityId, bondId: agentBondId },
+      arguments: agentClient.createAuthenticationArguments(
+        agentIdentityId,
+        agentBondId,
+        transport.sessionId!,
+      ),
     });
     expect(authResult.isError).toBeUndefined();
     const authText = (

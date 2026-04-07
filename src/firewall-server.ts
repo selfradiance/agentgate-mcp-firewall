@@ -24,6 +24,7 @@ import { UpstreamClient } from "./upstream-client.js";
 import type { AgentGateClient } from "./agentgate-client.js";
 import type { PolicyConfig } from "./policy.js";
 import { getExposure } from "./policy.js";
+import { AUTHENTICATION_EXPOSURE_CENTS } from "./authentication.js";
 
 const MAX_PAYLOAD_BYTES = 4000;
 
@@ -77,6 +78,7 @@ interface SessionAuth {
   identityId: string;
   bondId: string;
   authenticatedAt: number;
+  authActionId?: string;
 }
 
 const DEFAULT_PORT = 5555;
@@ -86,7 +88,7 @@ const AUTHENTICATE_TOOL: Tool = {
   name: "authenticate",
   description:
     "Authenticate with the MCP Firewall by providing your AgentGate identity and bond. " +
-    "Must be called before any other tool in this session.",
+    `Must be called before any other tool in this session. Reserves ${AUTHENTICATION_EXPOSURE_CENTS} cent on your bond while the session is open.`,
   inputSchema: {
     type: "object",
     properties: {
@@ -98,8 +100,21 @@ const AUTHENTICATE_TOOL: Tool = {
         type: "string",
         description: "Your active bond ID on AgentGate (e.g. bond_xxx)",
       },
+      nonce: {
+        type: "string",
+        description: "A unique nonce used when signing the authentication request.",
+      },
+      timestamp: {
+        type: "string",
+        description: "The signed timestamp for the authentication proof.",
+      },
+      signature: {
+        type: "string",
+        description:
+          "Ed25519 signature over the firewall auth action, bound to the current MCP session.",
+      },
     },
-    required: ["identityId", "bondId"],
+    required: ["identityId", "bondId", "nonce", "timestamp", "signature"],
   },
 };
 
@@ -145,6 +160,19 @@ export class FirewallServer {
     // Connect to the upstream MCP server and discover its tools
     await this.upstream.connect();
     this.upstreamTools = await this.upstream.listTools();
+    if (this.authRequired) {
+      const missingPolicyEntries = this.upstreamTools
+        .filter((tool) => !this.policy!.tools[tool.name])
+        .map((tool) => tool.name);
+
+      if (missingPolicyEntries.length > 0) {
+        await this.upstream.close();
+        throw new Error(
+          "Policy is missing explicit entries for upstream tools: " +
+            missingPolicyEntries.join(", "),
+        );
+      }
+    }
     console.log(
       `Firewall discovered ${this.upstreamTools.length} upstream tools: ${this.upstreamTools.map((t) => t.name).join(", ")}`,
     );
@@ -173,7 +201,7 @@ export class FirewallServer {
         transport.onclose = () => {
           if (transport.sessionId) {
             transports.delete(transport.sessionId);
-            this.sessionAuth.delete(transport.sessionId);
+            void this.releaseSession(transport.sessionId);
           }
         };
 
@@ -218,10 +246,36 @@ export class FirewallServer {
       res.status(200).end();
     });
 
+    app.use((error: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`MCP transport error: ${detail}`);
+
+      if (res.headersSent) {
+        return;
+      }
+
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Internal server error" },
+        id: null,
+      });
+    });
+
     this.httpServer = http.createServer(app);
 
-    return new Promise((resolve) => {
-      this.httpServer!.listen(this.port, () => {
+    return new Promise((resolve, reject) => {
+      const server = this.httpServer!;
+
+      const onError = (error: Error) => {
+        server.off("error", onError);
+        this.httpServer = null;
+        void this.upstream.close().catch(() => {});
+        reject(error);
+      };
+
+      server.once("error", onError);
+      server.listen(this.port, () => {
+        server.off("error", onError);
         const url = `http://127.0.0.1:${this.port}/mcp`;
         console.log(`MCP Firewall listening at ${url}`);
         resolve({ url });
@@ -267,6 +321,18 @@ export class FirewallServer {
         return this.handleAuthenticate(transport, args ?? {});
       }
 
+      if (!this.upstreamTools.some((tool) => tool.name === name)) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Tool "${name}" is not exposed by this firewall.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       // Gate upstream tools behind authentication
       if (this.authRequired) {
         const sessionId = transport.sessionId;
@@ -283,17 +349,14 @@ export class FirewallServer {
           };
         }
 
-        // AUDIT FIX (Finding 5): Re-verify identity if session auth has expired.
+        // Re-verify the authenticated identity periodically for long-lived sessions.
         const elapsed = Date.now() - session.authenticatedAt;
         if (elapsed > this.sessionTtlMs) {
-          // Session expired — re-verify identity on AgentGate
           try {
             await this.agentgateClient!.checkIdentity(session.identityId);
-            // Refresh the timestamp
             session.authenticatedAt = Date.now();
           } catch {
-            // Identity no longer valid — clear session and reject
-            this.sessionAuth.delete(sessionId);
+            await this.releaseSession(sessionId);
             return {
               content: [
                 {
@@ -446,6 +509,56 @@ export class FirewallServer {
     }
   }
 
+  private async releaseSession(sessionId: string): Promise<void> {
+    const session = this.sessionAuth.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    this.sessionAuth.delete(sessionId);
+
+    if (session.pending || !session.authActionId || !this.resolverClient) {
+      return;
+    }
+
+    try {
+      await this.resolverClient.resolveAction(session.authActionId, "success");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown error";
+      console.error(
+        `Failed to release authentication action ${session.authActionId}: ${detail}`,
+      );
+    }
+  }
+
+  private getAuthenticationFailureMessage(error: unknown): string {
+    const detail = error instanceof Error ? error.message : String(error);
+
+    if (
+      detail.includes("INVALID_SIGNATURE") ||
+      detail.includes("Signature") ||
+      detail.includes("401")
+    ) {
+      return "Authentication failed: signature could not be verified.";
+    }
+
+    if (detail.includes("IDENTITY_NOT_FOUND")) {
+      return "Authentication failed: identity could not be verified.";
+    }
+
+    if (
+      detail.includes("BOND_NOT_FOUND") ||
+      detail.includes("BOND_IDENTITY_MISMATCH") ||
+      detail.includes("BOND_NOT_ACTIVE") ||
+      detail.includes("BOND_EXPIRED") ||
+      detail.includes("INSUFFICIENT_BOND_CAPACITY")
+    ) {
+      return "Authentication failed: bond could not be verified.";
+    }
+
+    return "Authentication failed: AgentGate could not validate this session.";
+  }
+
   /** Handle the authenticate tool call. */
   private async handleAuthenticate(
     transport: StreamableHTTPServerTransport,
@@ -453,16 +566,23 @@ export class FirewallServer {
   ) {
     const identityId = args.identityId;
     const bondId = args.bondId;
+    const nonce = args.nonce;
+    const timestamp = args.timestamp;
+    const signature = args.signature;
 
     if (
       typeof identityId !== "string" || identityId.length === 0 ||
-      typeof bondId !== "string" || bondId.length === 0
+      typeof bondId !== "string" || bondId.length === 0 ||
+      typeof nonce !== "string" || nonce.length === 0 ||
+      typeof timestamp !== "string" || timestamp.length === 0 ||
+      typeof signature !== "string" || signature.length === 0
     ) {
       return {
         content: [
           {
             type: "text",
-            text: "Both identityId and bondId are required and must be non-empty strings.",
+            text:
+              "identityId, bondId, nonce, timestamp, and signature are all required and must be non-empty strings.",
           },
         ],
         isError: true,
@@ -503,51 +623,37 @@ export class FirewallServer {
       authenticatedAt: 0,
     });
 
-    // Verify the identity exists on AgentGate
-    let identitySummary;
     try {
-      identitySummary = await this.agentgateClient!.checkIdentity(identityId);
+      const authAction = await this.agentgateClient!.reserveAuthenticationBond({
+        identityId,
+        bondId,
+        nonce,
+        timestamp,
+        signature,
+      }, sessionId);
+
+      this.sessionAuth.set(sessionId, {
+        identityId,
+        bondId,
+        authenticatedAt: Date.now(),
+        authActionId: authAction.actionId,
+      });
     } catch (error) {
       // Verification failed — release the pending slot
       this.sessionAuth.delete(sessionId);
       const detail =
         error instanceof Error ? error.message : "Unknown error";
-      console.error(`Identity verification failed for "${identityId}": ${detail}`);
+      console.error(`Authentication failed for "${identityId}": ${detail}`);
       return {
         content: [
           {
             type: "text",
-            text: "Authentication failed: identity could not be verified.",
+            text: this.getAuthenticationFailureMessage(error),
           },
         ],
         isError: true,
       };
     }
-
-    // AUDIT FIX (Finding 3): Validate that the identity has at least one active bond.
-    // We cannot verify the specific bondId without a bond GET endpoint on AgentGate,
-    // but we can confirm the identity has posted bonds. The specific bond will be
-    // validated at execution time when AgentGate processes the bonded action.
-    if (identitySummary.reputation.stats.locks === 0) {
-      // Bond check failed — release the pending slot
-      this.sessionAuth.delete(sessionId);
-      return {
-        content: [
-          {
-            type: "text",
-            text: "Authentication failed: this identity has no bonds on AgentGate. Lock a bond before authenticating.",
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    // Promote from pending to fully authenticated
-    this.sessionAuth.set(sessionId, {
-      identityId,
-      bondId,
-      authenticatedAt: Date.now(),
-    });
 
     return {
       content: [
@@ -562,7 +668,11 @@ export class FirewallServer {
   /** Shut down the firewall and disconnect from the upstream. */
   async stop(): Promise<void> {
     await this.upstream.close();
-    this.sessionAuth.clear();
+    await Promise.allSettled(
+      Array.from(this.sessionAuth.keys()).map((sessionId) =>
+        this.releaseSession(sessionId),
+      ),
+    );
     if (this.httpServer) {
       await new Promise<void>((resolve, reject) => {
         this.httpServer!.close((err) => (err ? reject(err) : resolve()));

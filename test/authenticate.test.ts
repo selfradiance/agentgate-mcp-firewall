@@ -60,7 +60,9 @@ describe("authenticate tool", () => {
   let echoHttpServer: http.Server;
   let firewall: FirewallServer;
   let client: Client;
+  let transport: StreamableHTTPClientTransport;
   let running: boolean;
+  let agentClient: AgentGateClient;
   let agentIdentityId: string;
   let bondId: string;
   let firewallBondId: string;
@@ -107,7 +109,7 @@ describe("authenticate tool", () => {
     await resolverClient.registerIdentity();
 
     // Create a separate "agent" identity that will authenticate through the firewall
-    const agentClient = new AgentGateClient({
+    agentClient = new AgentGateClient({
       agentgateUrl: AGENTGATE_URL,
       identityPath: AGENT_IDENTITY_PATH,
       apiKey: API_KEY,
@@ -143,7 +145,7 @@ describe("authenticate tool", () => {
 
     // Connect a test MCP client to the firewall
     client = new Client({ name: "test-client", version: "1.0.0" });
-    const transport = new StreamableHTTPClientTransport(
+    transport = new StreamableHTTPClientTransport(
       new URL(`http://127.0.0.1:${FIREWALL_PORT}/mcp`),
     );
     await client.connect(transport);
@@ -194,7 +196,11 @@ describe("authenticate tool", () => {
 
     const result = await client.callTool({
       name: "authenticate",
-      arguments: { identityId: agentIdentityId, bondId },
+      arguments: agentClient.createAuthenticationArguments(
+        agentIdentityId,
+        bondId,
+        transport.sessionId!,
+      ),
     });
     expect(result.isError).toBeUndefined();
     const text = (result.content as Array<{ type: string; text: string }>)[0]
@@ -228,7 +234,13 @@ describe("authenticate tool", () => {
 
     const result = await client2.callTool({
       name: "authenticate",
-      arguments: { identityId: "id_nonexistent", bondId: "bond_fake" },
+      arguments: {
+        identityId: "id_nonexistent",
+        bondId: "bond_fake",
+        nonce: "nonce_fake",
+        timestamp: String(Date.now()),
+        signature: "signature_fake",
+      },
     });
     expect(result.isError).toBe(true);
     const text = (result.content as Array<{ type: string; text: string }>)[0]
@@ -236,5 +248,32 @@ describe("authenticate tool", () => {
     expect(text).toMatch(/[Ff]ailed/);
 
     await client2.close();
+  });
+
+  it("should reject authenticate when the signed bond ID does not exist", async () => {
+    if (!running) return;
+
+    const client3 = new Client({ name: "test-client-3", version: "1.0.0" });
+    const transport3 = new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${FIREWALL_PORT}/mcp`),
+    );
+    await client3.connect(transport3);
+
+    const fakeArgs = agentClient.createAuthenticationArguments(
+      agentIdentityId,
+      "bond_fake_not_real",
+      transport3.sessionId!,
+    );
+    const result = await client3.callTool({
+      name: "authenticate",
+      arguments: fakeArgs,
+    });
+
+    expect(result.isError).toBe(true);
+    const text = (result.content as Array<{ type: string; text: string }>)[0]
+      .text;
+    expect(text).toMatch(/[Bb]ond/);
+
+    await client3.close();
   });
 });

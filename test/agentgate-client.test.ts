@@ -9,7 +9,7 @@
  */
 
 import path from "node:path";
-import { unlinkSync, existsSync } from "node:fs";
+import { statSync, unlinkSync, existsSync } from "node:fs";
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { AgentGateClient } from "../src/agentgate-client.js";
 
@@ -18,6 +18,11 @@ const TEST_IDENTITY_PATH = path.resolve(
   import.meta.dirname,
   "fixtures",
   "test-firewall-identity.json",
+);
+const TEST_MODE_IDENTITY_PATH = path.resolve(
+  import.meta.dirname,
+  "fixtures",
+  "test-firewall-identity-mode.json",
 );
 
 // Check if AgentGate is running before attempting tests
@@ -61,6 +66,24 @@ describe("AgentGateClient", () => {
     if (existsSync(TEST_IDENTITY_PATH)) {
       unlinkSync(TEST_IDENTITY_PATH);
     }
+    if (existsSync(TEST_MODE_IDENTITY_PATH)) {
+      unlinkSync(TEST_MODE_IDENTITY_PATH);
+    }
+  });
+
+  it("should write identity files with owner-only permissions", () => {
+    if (existsSync(TEST_MODE_IDENTITY_PATH)) {
+      unlinkSync(TEST_MODE_IDENTITY_PATH);
+    }
+
+    const modeClient = new AgentGateClient({
+      identityPath: TEST_MODE_IDENTITY_PATH,
+    });
+
+    (modeClient as any).loadOrGenerateKeyPair();
+
+    const mode = statSync(TEST_MODE_IDENTITY_PATH).mode & 0o777;
+    expect(mode).toBe(0o600);
   });
 
   it("should register the firewall identity on AgentGate", async () => {

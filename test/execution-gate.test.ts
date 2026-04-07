@@ -63,6 +63,7 @@ describe("execution gate", () => {
   let firewall: FirewallServer;
   let client: Client;
   let running: boolean;
+  let agentClient: AgentGateClient;
   let agentIdentityId: string;
   let agentBondId: string;
   let firewallBondId: string;
@@ -109,7 +110,7 @@ describe("execution gate", () => {
     await resolverClient.registerIdentity();
 
     // Create a separate agent identity and lock a bond for it
-    const agentClient = new AgentGateClient({
+    agentClient = new AgentGateClient({
       agentgateUrl: AGENTGATE_URL,
       identityPath: AGENT_IDENTITY_PATH,
       apiKey: API_KEY,
@@ -151,7 +152,11 @@ describe("execution gate", () => {
     // Authenticate the agent on the firewall
     const authResult = await client.callTool({
       name: "authenticate",
-      arguments: { identityId: agentIdentityId, bondId: agentBondId },
+      arguments: agentClient.createAuthenticationArguments(
+        agentIdentityId,
+        agentBondId,
+        transport.sessionId!,
+      ),
     });
     const authText = (
       authResult.content as Array<{ type: string; text: string }>

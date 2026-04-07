@@ -75,6 +75,7 @@ describe("rollback on upstream failure", () => {
   let firewall: FirewallServer;
   let client: Client;
   let running: boolean;
+  let agentClient: AgentGateClient;
 
   beforeAll(async () => {
     running = await isAgentGateRunning();
@@ -107,7 +108,7 @@ describe("rollback on upstream failure", () => {
     await resolverClient.registerIdentity();
 
     // Create agent identity
-    const agentClient = new AgentGateClient({
+    agentClient = new AgentGateClient({
       agentgateUrl: AGENTGATE_URL,
       identityPath: AGENT_IDENTITY_PATH,
       apiKey: API_KEY,
@@ -141,7 +142,11 @@ describe("rollback on upstream failure", () => {
 
     await client.callTool({
       name: "authenticate",
-      arguments: { identityId: agentReg.identityId, bondId: agentBond.bondId },
+      arguments: agentClient.createAuthenticationArguments(
+        agentReg.identityId,
+        agentBond.bondId,
+        transport.sessionId!,
+      ),
     });
   });
 
@@ -195,6 +200,7 @@ describe("successful upstream call leaves action open", () => {
   let firewall: FirewallServer;
   let client: Client;
   let running: boolean;
+  let agentClient: AgentGateClient;
 
   beforeAll(async () => {
     running = await isAgentGateRunning();
@@ -222,7 +228,7 @@ describe("successful upstream call leaves action open", () => {
     await resolverClient.registerIdentity();
 
     // Create agent identity
-    const agentClient = new AgentGateClient({
+    agentClient = new AgentGateClient({
       agentgateUrl: AGENTGATE_URL,
       identityPath: AGENT_IDENTITY_PATH,
       apiKey: API_KEY,
@@ -256,7 +262,11 @@ describe("successful upstream call leaves action open", () => {
 
     await client.callTool({
       name: "authenticate",
-      arguments: { identityId: agentReg.identityId, bondId: agentBond.bondId },
+      arguments: agentClient.createAuthenticationArguments(
+        agentReg.identityId,
+        agentBond.bondId,
+        transport.sessionId!,
+      ),
     });
   });
 
