@@ -12,7 +12,6 @@ import {
   createHash,
   generateKeyPairSync,
   createPrivateKey,
-  createPublicKey,
   sign,
 } from "node:crypto";
 
