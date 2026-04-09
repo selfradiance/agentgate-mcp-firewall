@@ -7,7 +7,13 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  statSync,
+} from "node:fs";
 import {
   createHash,
   generateKeyPairSync,
@@ -467,6 +473,21 @@ export class AgentGateClient {
    */
   private loadOrGenerateKeyPair(): IdentityKeyPair {
     if (existsSync(this.identityPath)) {
+      const mode = statSync(this.identityPath).mode & 0o777;
+      if (mode !== 0o600) {
+        console.warn(
+          `Warning: identity file ${this.identityPath} has permissions ${mode.toString(8)}; expected 600. Fixing automatically.`,
+        );
+        try {
+          chmodSync(this.identityPath, 0o600);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(
+            `Identity file ${this.identityPath} has insecure permissions (${mode.toString(8)}) and could not be fixed: ${detail}`,
+          );
+        }
+      }
+
       const raw = readFileSync(this.identityPath, "utf-8");
       const parsed = JSON.parse(raw) as IdentityKeyPair;
 

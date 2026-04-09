@@ -9,8 +9,8 @@
  */
 
 import path from "node:path";
-import { statSync, unlinkSync, existsSync } from "node:fs";
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { chmodSync, statSync, unlinkSync, existsSync } from "node:fs";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import { AgentGateClient } from "../src/agentgate-client.js";
 
 const AGENTGATE_URL = "http://127.0.0.1:3000";
@@ -84,6 +84,30 @@ describe("AgentGateClient", () => {
 
     const mode = statSync(TEST_MODE_IDENTITY_PATH).mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+
+  it("should repair insecure permissions when loading an existing identity file", () => {
+    if (existsSync(TEST_MODE_IDENTITY_PATH)) {
+      unlinkSync(TEST_MODE_IDENTITY_PATH);
+    }
+
+    const modeClient = new AgentGateClient({
+      identityPath: TEST_MODE_IDENTITY_PATH,
+    });
+
+    const originalKeyPair = (modeClient as any).loadOrGenerateKeyPair();
+    chmodSync(TEST_MODE_IDENTITY_PATH, 0o644);
+
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const reloadedKeyPair = (modeClient as any).loadOrGenerateKeyPair();
+
+    const mode = statSync(TEST_MODE_IDENTITY_PATH).mode & 0o777;
+    expect(mode).toBe(0o600);
+    expect(reloadedKeyPair).toEqual(originalKeyPair);
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Fixing automatically."),
+    );
+    warnSpy.mockRestore();
   });
 
   it("should register the firewall identity on AgentGate", async () => {
