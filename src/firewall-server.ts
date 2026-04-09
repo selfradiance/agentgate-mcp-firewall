@@ -65,6 +65,10 @@ export type PathValidationResult =
   | { status: "valid"; resolvedPath: string }
   | { status: "malicious" };
 
+type GovernedArgsValidationResult =
+  | { status: "valid"; verificationPath?: string }
+  | { status: "malicious"; attemptedPath: string };
+
 /**
  * Validate that a requested path is inside the governed root.
  *
@@ -104,6 +108,91 @@ export function validatePath(
     // Parent doesn't exist or realpathSync failed — fail closed
     return { status: "malicious" };
   }
+}
+
+function describeAttemptedPath(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized) {
+      return serialized;
+    }
+  } catch {
+    // Fall back to String(value)
+  }
+
+  return String(value);
+}
+
+function validateGovernedArgs(
+  args: Record<string, unknown>,
+  governedRoot: string,
+): GovernedArgsValidationResult {
+  let verificationPath: string | undefined;
+
+  const validateSinglePath = (
+    value: unknown,
+    options: { useForVerification: boolean },
+  ): GovernedArgsValidationResult | undefined => {
+    if (typeof value !== "string") {
+      return { status: "malicious", attemptedPath: describeAttemptedPath(value) };
+    }
+
+    const pathResult = validatePath(value, governedRoot);
+    if (pathResult.status === "malicious") {
+      return { status: "malicious", attemptedPath: value };
+    }
+
+    if (options.useForVerification) {
+      verificationPath = pathResult.resolvedPath;
+    }
+
+    return undefined;
+  };
+
+  if ("path" in args) {
+    const result = validateSinglePath(args.path, { useForVerification: true });
+    if (result) {
+      return result;
+    }
+  }
+
+  if ("source" in args) {
+    const result = validateSinglePath(args.source, { useForVerification: false });
+    if (result) {
+      return result;
+    }
+  }
+
+  if ("destination" in args) {
+    const result = validateSinglePath(args.destination, {
+      useForVerification: true,
+    });
+    if (result) {
+      return result;
+    }
+  }
+
+  if ("paths" in args) {
+    if (!Array.isArray(args.paths)) {
+      return {
+        status: "malicious",
+        attemptedPath: describeAttemptedPath(args.paths),
+      };
+    }
+
+    for (const value of args.paths) {
+      const result = validateSinglePath(value, { useForVerification: false });
+      if (result) {
+        return result;
+      }
+    }
+  }
+
+  return { status: "valid", verificationPath };
 }
 
 export interface FirewallServerOptions {
@@ -549,17 +638,22 @@ export class FirewallServer {
         // Preflight path validation for governed filesystem tools.
         // resolvedPath (if valid) is the canonical location used for post-call verification.
         let resolvedPath: string | undefined;
-        if (this.policy?.governed_root && typeof (args ?? {}).path === "string") {
-          const requestedPath = (args as Record<string, unknown>).path as string;
-          const pathResult = validatePath(requestedPath, this.policy.governed_root);
+        if (this.policy?.governed_root) {
+          const pathResult = validateGovernedArgs(
+            args ?? {},
+            this.policy.governed_root,
+          );
 
           if (pathResult.status === "malicious") {
             // Sequential: execute → resolve('malicious') → return error.
             // Both must complete before the client gets a response.
-            return this.handlePreflightRejection(session, requestedPath);
+            return this.handlePreflightRejection(
+              session,
+              pathResult.attemptedPath,
+            );
           }
 
-          resolvedPath = pathResult.resolvedPath;
+          resolvedPath = pathResult.verificationPath;
         }
 
         // Record the bonded action on AgentGate before forwarding
