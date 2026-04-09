@@ -549,7 +549,7 @@ export class FirewallServer {
   /** Create a low-level MCP Server that proxies tool calls to the upstream. */
   private createServer(transport: StreamableHTTPServerTransport): Server {
     const server = new Server(
-      { name: "mcp-firewall", version: "0.2.0" },
+      { name: "mcp-firewall", version: "0.2.1" },
       { capabilities: { tools: {} } },
     );
 
