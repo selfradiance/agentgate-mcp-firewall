@@ -1,195 +1,184 @@
 # MCP Firewall
 
-A governance proxy for the Model Context Protocol (MCP). The MCP Firewall sits between MCP clients (Claude Desktop, coding agents, browser agents) and MCP servers (tool providers), intercepting every tool call. Before forwarding a call, it verifies the calling agent has an active bond on [AgentGate](https://github.com/selfradiance/agentgate) and reserves exposure proportional to the tool's risk tier. If the upstream call fails, the exposure is released. If it succeeds, the action stays open for external resolution. This is AgentGate's bond-and-slash model applied to the real-world infrastructure AI agents are actually using.
+A governance proxy for MCP tool calls. The MCP Firewall sits between MCP clients (Claude Desktop, coding agents, browser agents) and MCP servers (tool providers), intercepting every tool call. Before forwarding a call, it verifies the calling agent has an active bond on AgentGate and reserves exposure proportional to the tool's risk tier. Bad outcomes get slashed.
+
+## Why This Exists
+
+MCP adoption is exploding. Agents can now call arbitrary tools — file systems, databases, APIs, browsers, code execution environments — through a standardized protocol. But there's no enforcement layer between "agent wants to call a tool" and "tool executes." The trust model is binary: either the tool is available or it isn't.
+
+The MCP Firewall is the missing middle layer: the agent can call the tool, but it costs something if the outcome is bad.
+
+## How It Relates to AgentGate
+
+[AgentGate](https://github.com/selfradiance/agentgate) is the enforcement substrate. The firewall calls AgentGate's API to verify agent identity, check bond status, record actions (tool calls) against bonds, and resolve outcomes. The firewall is a client of AgentGate, not an extension — no changes to AgentGate core were needed.
+
+This is the project that connects the AgentGate ecosystem to what the industry is actually deploying. Agents 001–006 and the Delegation Identity Proof demonstrate the model in controlled environments. The MCP Firewall demonstrates it on live MCP infrastructure.
+
+## What It Does
+
+The firewall is an MCP proxy. It connects to an upstream MCP server (currently the `@modelcontextprotocol/server-filesystem` server via an HTTP wrapper), discovers its tools, and re-exposes a policy-filtered subset to clients. Only tools listed in the policy are exposed — everything else is silently blocked.
+
+Before any tool call is forwarded, the firewall:
+
+1. **Authenticates the caller** — the agent must prove identity ownership via Ed25519 proof-of-possession, bound to the MCP session.
+2. **Validates the path** — for filesystem tools, the requested path is validated against the governed workspace using `fs.realpathSync()` (defeats symlink escapes) and a separator-appended prefix check (defeats sibling prefix bypass). Both checks are required.
+3. **Records a bonded action** on AgentGate with exposure proportional to the tool's risk tier.
+4. **Forwards the call** to the upstream server.
+5. **Verifies the outcome** — for write operations, the firewall checks that the expected artifact exists on disk after the upstream reports success. Upstream success + missing artifact is resolved as malicious (bond slashed).
 
 ## Architecture
 
 ```
-+------------------+     +------------------+     +------------------+
-|  MCP Client       |---->|  MCP Firewall     |---->|  MCP Server       |
-|  (Claude Desktop, |     |  (Governance      |     |  (Tool Provider)  |
-|   coding agent,   |<----|   Proxy)          |<----|                   |
-|   browser agent)  |     |                   |     |                   |
-+------------------+     +--------+----------+     +------------------+
-                                  |
-                                  | bond check
-                                  | record action
-                                  | resolve on failure
-                                  |
-                                  v
-                         +------------------+
-                         |  AgentGate        |
-                         |  (Bond ledger,    |
-                         |   identity,       |
-                         |   resolution)     |
-                         +------------------+
+MCP Client (agent)
+      |
+      | Streamable HTTP
+      v
++------------------+
+|   MCP Firewall   |  <- authentication, path validation, bond enforcement
+|   (port 5555)    |
++------------------+
+      |
+      | Streamable HTTP
+      v
++---------------------+
+| Filesystem Wrapper  |  <- stdio-to-HTTP bridge (test fixture)
+|   (port 4445)       |
++---------------------+
+      |
+      | stdio
+      v
++---------------------+
+| @modelcontextprotocol|
+| /server-filesystem   |  <- actual filesystem operations
++---------------------+
+      |
+      v
+  ~/mcp-firewall-sandbox/   <- governed workspace (0o700)
 ```
 
-## How It Works
-
-1. **Agent authenticates.** The agent calls the `authenticate` tool on the firewall with its AgentGate identity ID and bond ID. The firewall verifies the identity exists on AgentGate, confirms it has at least one active bond, and binds it to the MCP session. Re-authentication on the same session is rejected.
-
-2. **Agent calls a tool.** The agent calls any upstream tool (e.g. `echo`, `write_file`, `query_db`) through the firewall as if it were calling the upstream server directly.
-
-3. **Firewall checks session.** The firewall verifies the session is authenticated. Sessions have a configurable TTL (default 5 minutes) — expired sessions trigger an identity re-verification on AgentGate before proceeding.
-
-4. **Firewall checks policy.** The firewall looks up the tool name in its policy config to determine the risk tier and required exposure in cents.
-
-5. **Firewall reserves exposure on AgentGate.** The firewall calls `executeBondedAction` on AgentGate, reserving the exposure amount against the firewall's bond. The action payload records the tool name, upstream URL, arguments, timestamp, and tier.
-
-6. **Firewall forwards to upstream.** If the bond reservation succeeds, the tool call is forwarded to the upstream MCP server.
-
-7. **Result or rollback.** If the upstream call succeeds, the result is returned to the agent and the action stays open on AgentGate for external resolution. If it fails, the firewall resolves the action as "failed" on AgentGate via a separate resolver identity, releasing the bond exposure.
-
-8. **External resolution.** A separate resolver identity can later resolve open actions as "success", "failed", or "malicious" — triggering refund, burn, or slash on AgentGate.
-
-9. **Session cleanup.** Clients can send a DELETE request to `/mcp` with their session ID to terminate the session. The firewall cleans up session auth state and transport resources.
+AgentGate runs separately on port 3000 and is called by the firewall for identity verification, bond management, and action recording/resolution.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Node.js 20+
-- [AgentGate](https://github.com/selfradiance/agentgate) running locally on port 3000
+- AgentGate running locally (`cd agentgate && npm run dev`)
 
-### Install
+### 1. Install dependencies
 
 ```bash
-git clone https://github.com/selfradiance/agentgate-mcp-firewall.git
-cd agentgate-mcp-firewall
 npm install
 ```
 
-### Create a Policy File
+### 2. Start AgentGate
+
+```bash
+cd ~/Desktop/projects/agentgate && npm run dev
+```
+
+### 3. Start the filesystem wrapper
+
+The wrapper bridges the filesystem server (stdio-only) to Streamable HTTP so the firewall can connect to it.
+
+```bash
+npx tsx test/fixtures/filesystem-server-wrapper.ts 4445 ~/mcp-firewall-sandbox
+```
+
+### 4. Create a policy file
 
 Create `policy.json` in the project root:
 
 ```json
 {
+  "governed_root": "/Users/yourname/mcp-firewall-sandbox",
   "tools": {
-    "echo": {
-      "tier": "low",
-      "exposure_cents": 100
-    },
     "write_file": {
-      "tier": "high",
-      "exposure_cents": 1000
-    },
-    "query_db": {
       "tier": "medium",
-      "exposure_cents": 500
+      "exposure_cents": 50
+    },
+    "create_directory": {
+      "tier": "low",
+      "exposure_cents": 10
     }
   },
-  "default_exposure_cents": 200
+  "default_exposure_cents": 100
 }
 ```
 
-### Environment Variables
+Set `governed_root` to the absolute path of your sandbox directory.
 
-| Variable | Default | Description |
-|---|---|---|
-| `UPSTREAM_MCP_URL` | `http://127.0.0.1:4444/mcp` | Full URL of the upstream MCP server to proxy |
-| `FIREWALL_PORT` | `5555` | Port the firewall listens on |
-| `AGENTGATE_URL` | `http://127.0.0.1:3000` | AgentGate server URL |
-| `AGENTGATE_REST_KEY` | (none) | API key for AgentGate (not needed in dev mode) |
-| `FIREWALL_POLICY_PATH` | `./policy.json` | Path to the policy config file |
-| `FIREWALL_IDENTITY_PATH` | `./agent-identity-firewall.json` | Path to the firewall's executor Ed25519 identity file |
-| `RESOLVER_IDENTITY_PATH` | `./agent-identity-resolver.json` | Path to the resolver Ed25519 identity file |
-| `FIREWALL_BOND_CENTS` | `100` | Bond amount in cents locked at startup |
-| `FIREWALL_BOND_TTL_SECONDS` | `3600` | Bond TTL in seconds (default: 1 hour) |
-
-### Run
+### 5. Start the firewall
 
 ```bash
 npm run dev
 ```
 
 The firewall will:
-1. Load the policy config from `policy.json`
-2. Generate Ed25519 identities on first run (executor + resolver) and register them with AgentGate
-3. Lock a bond on AgentGate for the executor identity
-4. Connect to the upstream MCP server, discover its tools
-5. Start listening for MCP client connections
+- Load the policy
+- Register executor and resolver identities on AgentGate
+- Lock a bond
+- Connect to the upstream wrapper with exponential backoff
+- Filter upstream tools to the policy allowlist
+- Run a canary write probe to verify upstream write access
+- Start listening on port 5555
 
-Shut down gracefully with Ctrl+C.
+### Environment variables
 
-## Policy Config Reference
+| Variable | Default | Description |
+|---|---|---|
+| `UPSTREAM_MCP_URL` | `http://127.0.0.1:4444/mcp` | Upstream MCP server URL |
+| `FIREWALL_PORT` | `5555` | Port the firewall listens on |
+| `FIREWALL_POLICY_PATH` | `./policy.json` | Path to the policy config file |
+| `FIREWALL_IDENTITY_PATH` | `./agent-identity-firewall.json` | Executor identity keypair file |
+| `RESOLVER_IDENTITY_PATH` | `./agent-identity-resolver.json` | Resolver identity keypair file |
+| `FIREWALL_BOND_CENTS` | `100` | Bond amount in cents |
+| `FIREWALL_BOND_TTL_SECONDS` | `3600` | Bond TTL in seconds |
+| `AGENTGATE_URL` | `http://127.0.0.1:3000` | AgentGate base URL |
 
-```json
-{
-  "tools": {
-    "<tool-name>": {
-      "tier": "<risk-tier-label>",
-      "exposure_cents": <positive-integer>
-    }
-  },
-  "default_exposure_cents": <positive-integer>
-}
-```
+## Behavioral Constraints
 
-- **tool-name**: Must match the tool name exactly as exposed by the upstream MCP server.
-- **tier**: A label for the risk category (e.g. "low", "medium", "high"). Recorded in the action payload on AgentGate for audit purposes.
-- **exposure_cents**: The bond exposure reserved on AgentGate for each call to this tool. AgentGate applies a 1.2x risk multiplier on top of this value.
-- **default_exposure_cents**: Fallback exposure for any tool not explicitly listed.
+**You must create parent directories before writing nested files.** The upstream filesystem server does not create intermediate directories automatically. If you call `write_file` with path `~/mcp-firewall-sandbox/subdir/file.txt`, the call will fail unless `subdir` already exists. Call `create_directory` first.
 
-## Session Security
+## Known Limitations
 
-- **Authentication gating.** Upstream tools are blocked until the agent authenticates with a valid AgentGate identity and bond ID.
-- **Session TTL.** Sessions expire after 5 minutes (configurable via `sessionTtlMs`). Expired sessions trigger identity re-verification on AgentGate. If re-verification fails, the session is cleared and the agent must re-authenticate.
-- **Re-authentication prevention.** A session can only be authenticated once. Attempting to re-authenticate (even with the same identity) is rejected. This prevents identity rebinding mid-session.
-- **Concurrent auth protection.** A synchronous pending marker prevents concurrent authenticate calls from racing past the duplicate check.
-- **Session cleanup.** Clients can terminate sessions via DELETE `/mcp`. Transport and auth state are cleaned up.
+These are intentional proof-of-concept tradeoffs, not bugs:
 
-## Outbound Resilience
+1. **Race condition between path validation and upstream execution.** The firewall validates the path, then forwards the call to the upstream server as two separate steps. A sufficiently fast filesystem change between validation and execution could theoretically alter what the path resolves to. Closing this gap would require atomic validate-and-execute, which the MCP protocol does not support.
 
-- **AgentGate timeouts.** All requests to AgentGate (identity verification, bonded action recording, action resolution) have a 10-second timeout. If AgentGate is slow or unreachable, the firewall fails fast.
-- **Upstream timeouts.** MCP operations against the upstream server (connect, tool discovery, tool calls) have a 30-second timeout.
-- **Redirect rejection.** Signed requests to AgentGate reject HTTP redirects to prevent forwarding of sensitive headers.
+2. **Shared filesystem assumption.** The post-call verification (`fs.existsSync` on the resolved path) assumes the firewall process and the upstream filesystem server see the same filesystem. If they run on different machines or in different containers with separate mounts, verification will always fail. This is by design for the single-machine POC.
 
-## Known Limitations (v0.1.0)
+3. **Same-user assumption.** The firewall secures `governed_root` with `0o700` (owner-only). This only provides isolation if the firewall and upstream run as the same OS user, which they do in the POC configuration. Multi-user or multi-tenant isolation would require OS-level sandboxing (containers, namespaces).
 
-- **Identifier-based auth.** The `authenticate` tool accepts an identity ID and bond ID. It does not require cryptographic proof-of-possession (the agent does not sign a challenge). A future version should require the agent to prove it holds the private key for the claimed identity.
-- **Single upstream server.** The firewall connects to one upstream MCP server. Multi-upstream support is not yet implemented.
-- **No automated outcome evaluation.** Actions stay open after successful tool calls. Resolution requires a separate resolver identity to manually or programmatically assess outcomes. There is no built-in evaluation of whether a tool call produced a "good" or "bad" result.
-- **Tool-name-only policy.** The policy config maps exposure by tool name only. It does not consider tool arguments (e.g. a `write_file` call to a temp directory vs. a system config file would have the same exposure).
-- **HTTP transport only.** The firewall uses Streamable HTTP. Stdio transport is not supported.
-- **Tier 1 bond cap.** New identities on AgentGate start at Tier 1 with a 100-cent bond cap. The firewall's own bond is subject to this limit until the identity builds reputation.
-- **Static tool discovery.** The upstream tool list is fetched once at startup and cached. If the upstream adds or removes tools at runtime, the firewall's list is stale until restart.
+4. **Orphaned upstream on firewall crash.** If the firewall process crashes or is killed without graceful shutdown, the upstream filesystem wrapper continues running. The wrapper has no auth and will accept tool calls from anything that connects. In production, the wrapper would need its own lifecycle management or be supervised alongside the firewall.
 
-## Tech Stack
+5. **Path validation checks `args.path` only.** Tools that use different field names for file paths (e.g., `source`, `destination`) are not protected by the boundary check and must not be added to the policy allowlist without updating the validation logic in `firewall-server.ts`.
 
-- **Language:** TypeScript
-- **Runtime:** Node.js 20+
-- **MCP SDK:** @modelcontextprotocol/sdk
-- **Testing:** Vitest
-- **HTTP framework:** Express (for the firewall's MCP transport)
-- **Signing:** Node.js built-in crypto (Ed25519)
-- **Config:** dotenv + JSON policy file
+## Startup Verification
+
+On startup, the firewall verifies it can write to the governed workspace via the upstream server. It sends a `write_file` call for a canary file (`.mcp-firewall-canary`) through the full MCP chain — firewall to wrapper to filesystem server to disk — then checks that the file actually appeared on disk, then deletes it. If the canary write fails or the file doesn't appear, the firewall refuses to start. This proves functional write access through the entire proxy chain, not just that the upstream is reachable.
 
 ## Tests
 
+71 tests across 14 files. Run with:
+
 ```bash
-# Run all tests
 npm test
-
-# Run a specific test file
-npx vitest run test/policy.test.ts
 ```
 
-Unit tests (policy, placeholder) run without external dependencies. Integration tests require AgentGate running locally on port 3000:
+Integration tests that require AgentGate skip gracefully with a warning when AgentGate is not running on localhost:3000. Unit tests (path validation, policy loading, upstream client, startup sequence) run without any external dependencies.
 
-```bash
-# Start AgentGate first
-cd ~/Desktop/projects/agentgate && npm run dev
+## Scope / Non-Goals
 
-# Then run tests
-cd ~/Desktop/projects/agentgate-mcp-firewall && npm test
-```
+v0.2.0 explicitly does not:
 
-Integration tests that require AgentGate will skip gracefully with a warning if it is not running.
+- **Evaluate file content.** The firewall checks where files are written, not what they contain. Content-based policies (e.g., "don't write credentials to disk") are out of scope.
+- **Support multi-tenant isolation.** One firewall instance governs one workspace for one user. There is no tenant separation, namespace isolation, or per-agent workspace partitioning.
+- **Target production deployment.** This is a proof-of-concept demonstrating that MCP tool calls can be economically governed via bond enforcement. It runs on localhost, uses a test fixture as the transport bridge, and assumes a trusted single-machine environment.
+- **Implement content-addressed verification.** Post-call verification checks existence, not integrity. A future version could hash file contents and compare against expected outputs.
 
-**Note:** If AgentGate is not running in dev mode, integration tests require the `AGENTGATE_REST_KEY` environment variable to be set (e.g. `AGENTGATE_REST_KEY=testkey123 npm test`).
+## Related Projects
 
-## License
-
-MIT License. See [LICENSE](./LICENSE).
+- [AgentGate](https://github.com/selfradiance/agentgate) — the bond-and-slash enforcement substrate
+- [AgentGate Agents](https://github.com/selfradiance/agentgate-agents) — reference agent implementations (001–006)
+- [Delegation Identity Proof](https://github.com/selfradiance/delegation-identity-proof) — Ed25519 identity delegation demonstration

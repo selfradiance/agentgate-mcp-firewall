@@ -209,6 +209,7 @@ export class AgentGateClient {
     try {
       response = await fetch(`${this.baseUrl}/v1/identities/${identityId}`, {
         signal: controller.signal,
+        redirect: "error",
       });
     } finally {
       clearTimeout(timer);
@@ -410,6 +411,7 @@ export class AgentGateClient {
     const timer = setTimeout(() => controller.abort(), AGENTGATE_TIMEOUT_MS);
     try {
       return await fetch(`${this.baseUrl}${path}`, {
+        redirect: "error",
         ...init,
         signal: controller.signal,
       });

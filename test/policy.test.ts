@@ -25,6 +25,50 @@ describe("loadPolicy", () => {
       "not valid JSON",
     );
   });
+
+  it("should load a valid policy with governed_root", () => {
+    const policy = loadPolicy(path.join(FIXTURES, "filesystem-policy.json"));
+    expect(policy.governed_root).toBe("/Users/jamestoole/mcp-firewall-sandbox");
+    expect(policy.tools.write_file.tier).toBe("medium");
+    expect(policy.tools.write_file.exposure_cents).toBe(50);
+    expect(policy.tools.create_directory.tier).toBe("low");
+    expect(policy.tools.create_directory.exposure_cents).toBe(10);
+  });
+
+  it("should accept a policy without governed_root (v0.1 compatibility)", () => {
+    const policy = loadPolicy(path.join(FIXTURES, "test-policy.json"));
+    expect(policy.governed_root).toBeUndefined();
+  });
+
+  it("should throw on relative governed_root", async () => {
+    const fs = await import("node:fs");
+    const tmpPath = path.join(FIXTURES, "tmp-relative-root.json");
+    fs.writeFileSync(tmpPath, JSON.stringify({
+      governed_root: "relative/path",
+      tools: { write_file: { tier: "medium", exposure_cents: 50 } },
+      default_exposure_cents: 100,
+    }));
+    try {
+      expect(() => loadPolicy(tmpPath)).toThrow("must be an absolute path");
+    } finally {
+      fs.unlinkSync(tmpPath);
+    }
+  });
+
+  it("should throw on empty governed_root", async () => {
+    const fs = await import("node:fs");
+    const tmpPath = path.join(FIXTURES, "tmp-empty-root.json");
+    fs.writeFileSync(tmpPath, JSON.stringify({
+      governed_root: "",
+      tools: { write_file: { tier: "medium", exposure_cents: 50 } },
+      default_exposure_cents: 100,
+    }));
+    try {
+      expect(() => loadPolicy(tmpPath)).toThrow("must be a non-empty string");
+    } finally {
+      fs.unlinkSync(tmpPath);
+    }
+  });
 });
 
 describe("getExposure", () => {

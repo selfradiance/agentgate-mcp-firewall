@@ -1,0 +1,14 @@
+{
+  "governed_root": "/Users/jamestoole/mcp-firewall-sandbox",
+  "tools": {
+    "write_file": {
+      "tier": "medium",
+      "exposure_cents": 50
+    },
+    "create_directory": {
+      "tier": "low",
+      "exposure_cents": 10
+    }
+  },
+  "default_exposure_cents": 100
+}

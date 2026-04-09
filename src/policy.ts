@@ -16,6 +16,8 @@ export interface ToolPolicy {
 export interface PolicyConfig {
   tools: Record<string, ToolPolicy>;
   default_exposure_cents: number;
+  /** Absolute path to the governed workspace directory (required for v0.2+ filesystem governance). */
+  governed_root?: string;
 }
 
 const DEFAULT_POLICY_PATH = "./policy.json";
@@ -84,9 +86,26 @@ function validatePolicy(parsed: unknown, path: string): PolicyConfig {
     }
   }
 
+  // Validate governed_root if present — must be an absolute path
+  let governed_root: string | undefined;
+  if (obj.governed_root !== undefined) {
+    if (typeof obj.governed_root !== "string" || obj.governed_root.length === 0) {
+      throw new Error(
+        `Policy "governed_root" must be a non-empty string: ${path}`,
+      );
+    }
+    if (!obj.governed_root.startsWith("/")) {
+      throw new Error(
+        `Policy "governed_root" must be an absolute path (starts with /): ${path}`,
+      );
+    }
+    governed_root = obj.governed_root;
+  }
+
   return {
     tools: tools as Record<string, ToolPolicy>,
     default_exposure_cents: obj.default_exposure_cents,
+    governed_root,
   };
 }
 

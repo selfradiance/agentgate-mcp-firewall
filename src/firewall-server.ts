@@ -11,6 +11,8 @@
  */
 
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import http from "node:http";
 import express from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -27,6 +29,7 @@ import { getExposure } from "./policy.js";
 import { AUTHENTICATION_EXPOSURE_CENTS } from "./authentication.js";
 
 const MAX_PAYLOAD_BYTES = 4000;
+const DEFAULT_MAX_SESSIONS = 1000;
 
 /** Default session auth TTL: 5 minutes. After this, the firewall re-verifies the identity. */
 const DEFAULT_SESSION_TTL_MS = 5 * 60 * 1000;
@@ -48,11 +51,59 @@ function sanitizePayload(payload: Record<string, unknown>): Record<string, unkno
 
   if (budget > 20) {
     const argsStr = JSON.stringify(payload.arguments);
-    const truncated = argsStr.slice(0, budget - 15) + "...[truncated]";
+    const argsBuf = Buffer.from(argsStr, "utf-8");
+    // Truncate at byte boundary, then decode back to string (safe: invalid trailing bytes are replaced)
+    const sliced = argsBuf.subarray(0, budget - 15).toString("utf-8");
+    const truncated = sliced + "...[truncated]";
     return { ...payload, arguments: truncated };
   }
 
   return withoutArgs;
+}
+
+export type PathValidationResult =
+  | { status: "valid"; resolvedPath: string }
+  | { status: "malicious" };
+
+/**
+ * Validate that a requested path is inside the governed root.
+ *
+ * Two checks are BOTH required:
+ * 1. fs.realpathSync() on the parent directory — defeats symlink escapes
+ *    (a symlink inside governed_root pointing to /etc/ resolves to /etc/).
+ * 2. Separator-appended prefix check — defeats sibling prefix bypasses
+ *    (e.g. /governed_root-evil/... would pass a naive startsWith check).
+ *
+ * Neither check alone is sufficient.
+ *
+ * On success, returns the canonical resolved path (resolved parent + basename).
+ * This resolved path should be used for post-call verification (fs.existsSync),
+ * not the raw path from the tool arguments.
+ *
+ * If the parent directory doesn't exist, realpathSync throws. The catch
+ * returns 'malicious' (fail closed) — callers never see a thrown exception
+ * from this function.
+ */
+export function validatePath(
+  requestedPath: string,
+  governedRoot: string,
+): PathValidationResult {
+  try {
+    const parentDir = path.dirname(requestedPath);
+    const resolvedParent = fs.realpathSync(parentDir);
+    const normalizedRoot = governedRoot.endsWith(path.sep)
+      ? governedRoot
+      : governedRoot + path.sep;
+    if (resolvedParent.startsWith(normalizedRoot) || resolvedParent === governedRoot) {
+      // Canonical path: resolved parent + original basename
+      const resolvedPath = path.join(resolvedParent, path.basename(requestedPath));
+      return { status: "valid", resolvedPath };
+    }
+    return { status: "malicious" };
+  } catch {
+    // Parent doesn't exist or realpathSync failed — fail closed
+    return { status: "malicious" };
+  }
 }
 
 export interface FirewallServerOptions {
@@ -70,6 +121,10 @@ export interface FirewallServerOptions {
   firewallBondId?: string;
   /** Session auth TTL in milliseconds (default: 5 minutes). After expiry, identity is re-verified. */
   sessionTtlMs?: number;
+  /** Maximum concurrent sessions (default: 1000). New sessions are rejected with 503 when the limit is hit. */
+  maxSessions?: number;
+  /** Host/interface to bind to (default: "127.0.0.1"). Set to "0.0.0.0" to accept connections from all interfaces. */
+  host?: string;
 }
 
 interface SessionAuth {
@@ -123,26 +178,103 @@ export class FirewallServer {
   private upstream: UpstreamClient;
   private upstreamTools: Tool[] = [];
   private port: number;
+  private host: string;
   private agentgateClient: AgentGateClient | undefined;
   private resolverClient: AgentGateClient | undefined;
   private policy: PolicyConfig | undefined;
   private firewallBondId: string | undefined;
   private sessionTtlMs: number;
+  private maxSessions: number;
   private sessionAuth = new Map<string, SessionAuth>();
+  private transports = new Map<string, StreamableHTTPServerTransport>();
 
   constructor(private options: FirewallServerOptions) {
     this.port = options.port ?? DEFAULT_PORT;
+    this.host = options.host ?? "127.0.0.1";
     this.upstream = new UpstreamClient({ url: options.upstreamUrl });
     this.agentgateClient = options.agentgateClient;
     this.resolverClient = options.resolverClient;
     this.policy = options.policy;
     this.firewallBondId = options.firewallBondId;
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
+    this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
   }
 
   /** Whether authentication is required (AgentGate client was provided). */
   private get authRequired(): boolean {
     return this.agentgateClient !== undefined;
+  }
+
+  /**
+   * Connect to the upstream MCP server with exponential backoff.
+   * 3 attempts: delays of 1s, 2s, 4s between retries.
+   */
+  private async connectWithRetry(): Promise<void> {
+    const delays = [1000, 2000, 4000];
+    let lastError: Error | undefined;
+
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        await this.upstream.connect();
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        if (attempt < delays.length) {
+          console.log(
+            `Upstream connection attempt ${attempt + 1} failed, retrying in ${delays[attempt]}ms...`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delays[attempt]));
+        }
+      }
+    }
+
+    throw new Error(
+      `Upstream MCP server not reachable after ${delays.length + 1} attempts — is the filesystem wrapper running? Last error: ${lastError?.message}`,
+    );
+  }
+
+  /**
+   * Canary write probe: write a timestamped file to governed_root via the upstream,
+   * verify it exists on disk, then delete it. Proves functional write access.
+   */
+  private async canaryWriteProbe(governedRoot: string): Promise<void> {
+    const canaryPath = path.join(governedRoot, ".mcp-firewall-canary");
+    const canaryContent = `canary-${Date.now()}`;
+
+    try {
+      const result = await this.upstream.callTool("write_file", {
+        path: canaryPath,
+        content: canaryContent,
+      });
+
+      if (result.isError) {
+        const text = (result.content as Array<{ type: string; text?: string }>)[0]?.text ?? "unknown error";
+        throw new Error(`Upstream write_file returned error: ${text}`);
+      }
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Canary write probe failed — upstream cannot write to governed_root. ` +
+        `Check filesystem server allowed directories include "${governedRoot}". ` +
+        `Error: ${detail}`,
+      );
+    }
+
+    if (!fs.existsSync(canaryPath)) {
+      throw new Error(
+        `Canary write probe failed — upstream reported success but file not found at "${canaryPath}". ` +
+        `The firewall and upstream may not share the same filesystem view.`,
+      );
+    }
+
+    try {
+      fs.unlinkSync(canaryPath);
+    } catch {
+      // Non-fatal — canary file left behind is harmless
+      console.warn(`Warning: could not delete canary file at ${canaryPath}`);
+    }
+
+    console.log("Canary write probe passed: upstream write access to governed_root verified.");
   }
 
   /** Start the firewall: connect to upstream, discover tools, listen for clients. */
@@ -157,50 +289,92 @@ export class FirewallServer {
       );
     }
 
-    // Connect to the upstream MCP server and discover its tools
-    await this.upstream.connect();
+    // Step 3a: Secure governed_root if configured
+    if (this.policy?.governed_root) {
+      try {
+        fs.mkdirSync(this.policy.governed_root, { recursive: true, mode: 0o700 });
+        // Canonicalize governed_root after creation. On macOS, /tmp symlinks to
+        // /private/tmp — without this, realpathSync on children returns
+        // /private/tmp/... while governed_root is /tmp/..., failing the prefix check.
+        this.policy.governed_root = fs.realpathSync(this.policy.governed_root);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Failed to secure governed_root "${this.policy.governed_root}": ${detail}`,
+        );
+      }
+      console.log(`Governed root secured: ${this.policy.governed_root}`);
+    }
+
+    // Step 3b: Connect to the upstream MCP server with exponential backoff
+    await this.connectWithRetry();
     this.upstreamTools = await this.upstream.listTools();
+    // Filter upstream tools to only those listed in policy (allowlist).
+    // Tools not in policy are silently blocked — they won't appear in the
+    // tool list and calls to them are rejected.
     if (this.authRequired) {
-      const missingPolicyEntries = this.upstreamTools
+      const allUpstreamTools = this.upstreamTools;
+      this.upstreamTools = allUpstreamTools.filter(
+        (tool) => !!this.policy!.tools[tool.name],
+      );
+
+      const blocked = allUpstreamTools
         .filter((tool) => !this.policy!.tools[tool.name])
         .map((tool) => tool.name);
 
-      if (missingPolicyEntries.length > 0) {
+      if (blocked.length > 0) {
+        console.log(
+          `Firewall blocking ${blocked.length} upstream tools not in policy: ${blocked.join(", ")}`,
+        );
+      }
+
+      if (this.upstreamTools.length === 0) {
         await this.upstream.close();
         throw new Error(
-          "Policy is missing explicit entries for upstream tools: " +
-            missingPolicyEntries.join(", "),
+          "No upstream tools match the policy allowlist. Check policy config.",
         );
       }
     }
     console.log(
-      `Firewall discovered ${this.upstreamTools.length} upstream tools: ${this.upstreamTools.map((t) => t.name).join(", ")}`,
+      `Firewall exposing ${this.upstreamTools.length} upstream tools: ${this.upstreamTools.map((t) => t.name).join(", ")}`,
     );
+
+    // Step 3c: Canary write probe — verify upstream can write to governed_root
+    if (this.policy?.governed_root) {
+      await this.canaryWriteProbe(this.policy.governed_root);
+    }
 
     // Set up the Express app and HTTP server
     const app = express();
     app.use(express.json());
-
-    const transports = new Map<string, StreamableHTTPServerTransport>();
 
     app.post("/mcp", async (req, res) => {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
       let transport: StreamableHTTPServerTransport;
 
-      if (sessionId && transports.has(sessionId)) {
-        transport = transports.get(sessionId)!;
+      if (sessionId && this.transports.has(sessionId)) {
+        transport = this.transports.get(sessionId)!;
       } else {
+        if (this.transports.size >= this.maxSessions) {
+          res.status(503).json({
+            jsonrpc: "2.0",
+            error: { code: -32000, message: "Server session limit reached. Try again later." },
+            id: null,
+          });
+          return;
+        }
+
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            transports.set(newSessionId, transport);
+            this.transports.set(newSessionId, transport);
           },
         });
 
         transport.onclose = () => {
           if (transport.sessionId) {
-            transports.delete(transport.sessionId);
+            this.transports.delete(transport.sessionId);
             void this.releaseSession(transport.sessionId);
           }
         };
@@ -216,7 +390,7 @@ export class FirewallServer {
     app.get("/mcp", async (req, res) => {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-      if (!sessionId || !transports.has(sessionId)) {
+      if (!sessionId || !this.transports.has(sessionId)) {
         res.status(400).json({
           jsonrpc: "2.0",
           error: { code: -32000, message: "Bad Request: No valid session ID" },
@@ -225,14 +399,14 @@ export class FirewallServer {
         return;
       }
 
-      const transport = transports.get(sessionId)!;
+      const transport = this.transports.get(sessionId)!;
       await transport.handleRequest(req, res);
     });
 
     app.delete("/mcp", async (req, res) => {
       const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-      if (!sessionId || !transports.has(sessionId)) {
+      if (!sessionId || !this.transports.has(sessionId)) {
         res.status(404).json({
           jsonrpc: "2.0",
           error: { code: -32000, message: "Session not found" },
@@ -241,7 +415,7 @@ export class FirewallServer {
         return;
       }
 
-      const transport = transports.get(sessionId)!;
+      const transport = this.transports.get(sessionId)!;
       await transport.close();
       res.status(200).end();
     });
@@ -274,9 +448,9 @@ export class FirewallServer {
       };
 
       server.once("error", onError);
-      server.listen(this.port, () => {
+      server.listen(this.port, this.host, () => {
         server.off("error", onError);
-        const url = `http://127.0.0.1:${this.port}/mcp`;
+        const url = `http://${this.host}:${this.port}/mcp`;
         console.log(`MCP Firewall listening at ${url}`);
         resolve({ url });
       });
@@ -286,7 +460,7 @@ export class FirewallServer {
   /** Create a low-level MCP Server that proxies tool calls to the upstream. */
   private createServer(transport: StreamableHTTPServerTransport): Server {
     const server = new Server(
-      { name: "mcp-firewall", version: "0.1.0" },
+      { name: "mcp-firewall", version: "0.2.0" },
       { capabilities: { tools: {} } },
     );
 
@@ -322,11 +496,14 @@ export class FirewallServer {
       }
 
       if (!this.upstreamTools.some((tool) => tool.name === name)) {
+        const safeName = typeof name === "string" && name.length > 128
+          ? name.slice(0, 128) + "...[truncated]"
+          : name;
         return {
           content: [
             {
               type: "text",
-              text: `Tool "${name}" is not exposed by this firewall.`,
+              text: `Tool "${safeName}" is not exposed by this firewall.`,
             },
           ],
           isError: true,
@@ -369,6 +546,22 @@ export class FirewallServer {
           }
         }
 
+        // Preflight path validation for governed filesystem tools.
+        // resolvedPath (if valid) is the canonical location used for post-call verification.
+        let resolvedPath: string | undefined;
+        if (this.policy?.governed_root && typeof (args ?? {}).path === "string") {
+          const requestedPath = (args as Record<string, unknown>).path as string;
+          const pathResult = validatePath(requestedPath, this.policy.governed_root);
+
+          if (pathResult.status === "malicious") {
+            // Sequential: execute → resolve('malicious') → return error.
+            // Both must complete before the client gets a response.
+            return this.handlePreflightRejection(session, requestedPath);
+          }
+
+          resolvedPath = pathResult.resolvedPath;
+        }
+
         // Record the bonded action on AgentGate before forwarding
         const gateResult = await this.recordBondedAction(
           name,
@@ -387,8 +580,13 @@ export class FirewallServer {
           };
         }
 
-        // Forward to upstream, with rollback on failure
-        return this.forwardWithRollback(name, args ?? {}, gateResult.actionId);
+        // Forward to upstream, with post-call verification for governed tools
+        return this.forwardWithVerification(
+          name,
+          args ?? {},
+          gateResult.actionId,
+          resolvedPath,
+        );
       }
 
       // Forward to upstream (auth not enabled)
@@ -400,14 +598,22 @@ export class FirewallServer {
   }
 
   /**
-   * Forward a tool call to the upstream server with rollback on failure.
-   * If the upstream call fails, resolve the action as "failed" on AgentGate
-   * to release the bond exposure. On success, the action stays open.
+   * Forward a tool call to the upstream server with outcome evaluation.
+   *
+   * Outcome rules:
+   *   - Upstream error (MCP-level or transport) → resolve as "failed" (bond released)
+   *   - Upstream success + resolvedPath provided + artifact exists → resolve as "success" (bond released)
+   *   - Upstream success + resolvedPath provided + artifact missing → resolve as "malicious" (bond slashed)
+   *   - Upstream success + no resolvedPath (non-governed tool) → action stays open for external review
+   *   - Unclassifiable state → resolve as "malicious" (conservative default)
+   *
+   * @param resolvedPath Canonical path from validatePath. Used for post-call fs.existsSync() verification.
    */
-  private async forwardWithRollback(
+  private async forwardWithVerification(
     toolName: string,
     args: Record<string, unknown>,
     actionId: string,
+    resolvedPath?: string,
   ) {
     let result: Awaited<ReturnType<typeof this.upstream.callTool>>;
     let failed = false;
@@ -435,12 +641,11 @@ export class FirewallServer {
       };
     }
 
+    // Outcome: upstream error → resolve as "failed" (bond released)
     if (failed && this.resolverClient) {
-      // Resolve the action as "failed" to release bond exposure
       try {
         await this.resolverClient.resolveAction(actionId, "failed");
       } catch (resolveError) {
-        // Log but don't block — the primary error is the upstream failure
         const resolveMsg =
           resolveError instanceof Error
             ? resolveError.message
@@ -461,8 +666,43 @@ export class FirewallServer {
       };
     }
 
-    // Upstream succeeded — action stays open on AgentGate.
-    // No auto-resolve; the action remains for external review/resolution.
+    // Post-call verification for governed filesystem tools
+    if (!failed && resolvedPath && this.resolverClient) {
+      const artifactExists = fs.existsSync(resolvedPath);
+
+      if (artifactExists) {
+        // Outcome: upstream success + artifact confirmed → resolve as "success"
+        try {
+          await this.resolverClient.resolveAction(actionId, "success");
+        } catch (resolveError) {
+          const msg = resolveError instanceof Error ? resolveError.message : String(resolveError);
+          console.error(`Failed to resolve action ${actionId} as success: ${msg}`);
+        }
+      } else {
+        // Outcome: upstream success + artifact missing → anomaly → resolve as "malicious"
+        console.error(
+          `Post-call verification failed: upstream reported success for "${toolName}" ` +
+          `but artifact not found at "${resolvedPath}". Resolving as malicious.`,
+        );
+        try {
+          await this.resolverClient.resolveAction(actionId, "malicious");
+        } catch (resolveError) {
+          const msg = resolveError instanceof Error ? resolveError.message : String(resolveError);
+          console.error(`Failed to resolve action ${actionId} as malicious: ${msg}`);
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Tool call completed but post-call verification failed. Bond has been slashed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     return result!;
   }
 
@@ -507,6 +747,61 @@ export class FirewallServer {
         : "bond verification failed";
       return { blocked: true, reason };
     }
+  }
+
+  /**
+   * Handle a preflight rejection: path validation caught a traversal attempt.
+   *
+   * Sequential pattern — both steps must complete before the error is returned:
+   *   1. executeBondedAction with actionType "firewall.preflight_rejection"
+   *   2. resolveAction as "malicious" (bond slashed)
+   *   3. Return error to client
+   *
+   * The attempted path is truncated to 256 characters before inclusion in the
+   * AgentGate payload — raw user input is never passed unsanitized.
+   */
+  private async handlePreflightRejection(
+    session: SessionAuth,
+    attemptedPath: string,
+  ) {
+    const MAX_PATH_LENGTH = 256;
+    const sanitizedPath = attemptedPath.length > MAX_PATH_LENGTH
+      ? attemptedPath.slice(0, MAX_PATH_LENGTH) + "...[truncated]"
+      : attemptedPath;
+
+    const payload = {
+      attemptedPath: sanitizedPath,
+      agentIdentityId: session.identityId,
+      agentBondId: session.bondId,
+      timestamp: new Date().toISOString(),
+      reason: "Path resolves outside governed workspace",
+    };
+
+    try {
+      const result = await this.agentgateClient!.executeBondedAction(
+        this.firewallBondId!,
+        "firewall.preflight_rejection",
+        payload,
+        getExposure(this.policy!, "write_file"),
+      );
+
+      await this.resolverClient!.resolveAction(result.actionId, "malicious");
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.error(`Preflight rejection bond accounting failed: ${detail}`);
+      // Bond accounting failed, but we still reject the request.
+      // The failure is logged — manual reconciliation may be needed.
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: "Path validation failed: requested path is outside governed workspace.",
+        },
+      ],
+      isError: true,
+    };
   }
 
   private async releaseSession(sessionId: string): Promise<void> {
@@ -583,6 +878,27 @@ export class FirewallServer {
             type: "text",
             text:
               "identityId, bondId, nonce, timestamp, and signature are all required and must be non-empty strings.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Length limits prevent memory bloat and oversized AgentGate payloads.
+    const MAX_ID_LENGTH = 256;
+    const MAX_SIGNATURE_LENGTH = 512;
+    if (
+      identityId.length > MAX_ID_LENGTH ||
+      bondId.length > MAX_ID_LENGTH ||
+      nonce.length > MAX_ID_LENGTH ||
+      timestamp.length > MAX_ID_LENGTH ||
+      signature.length > MAX_SIGNATURE_LENGTH
+    ) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Authentication fields exceed maximum allowed length.",
           },
         ],
         isError: true,
@@ -673,6 +989,11 @@ export class FirewallServer {
         this.releaseSession(sessionId),
       ),
     );
+    // Close all transports explicitly to free MCP Server instances
+    await Promise.allSettled(
+      Array.from(this.transports.values()).map((t) => t.close()),
+    );
+    this.transports.clear();
     if (this.httpServer) {
       await new Promise<void>((resolve, reject) => {
         this.httpServer!.close((err) => (err ? reject(err) : resolve()));
