@@ -6,7 +6,7 @@ A governance proxy for MCP tool calls. The MCP Firewall sits between MCP clients
 
 MCP adoption is exploding. Agents can now call arbitrary tools — file systems, databases, APIs, browsers, code execution environments — through a standardized protocol. But there's no enforcement layer between "agent wants to call a tool" and "tool executes." The trust model is binary: either the tool is available or it isn't.
 
-The MCP Firewall is the missing middle layer: the agent can call the tool, but it costs something if the outcome is bad.
+The MCP Firewall is the missing middle layer: the agent can call the tool, but it costs something if the outcome is bad. It is the runtime enforcement point that makes each MCP tool call observable, attributable to a specific agent identity, and consequential — treating every invocation as a security-relevant action rather than an opaque function call.
 
 ## How It Relates to AgentGate
 
