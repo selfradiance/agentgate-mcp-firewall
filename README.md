@@ -16,6 +16,14 @@ This release is intentionally small. It is a proof-of-concept for one independen
 
 If you want the fastest proof path, jump to [First Run: Flagship Demo](#first-run-flagship-demo) and run `npm run demo:write-file`.
 
+## Quick Explainer
+
+For a short visual introduction to the AgentGate / MCP Firewall idea, see:
+
+**[AgentGate explainer thread on X](https://x.com/selfradiance11/status/2046010251128832398)**
+
+Part 3 covers the governed `write_file` example directly.
+
 ## Why This Exists
 
 An MCP client normally has to trust the upstream MCP server's answer about whether a tool call succeeded. That is not a safe assumption for a governance proxy. If the upstream is compromised or dishonest, it can claim success without producing the intended effect, or it can produce a different effect than the one the client requested.
