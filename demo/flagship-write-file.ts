@@ -77,7 +77,7 @@ async function ensureAgentGateRunning(): Promise<void> {
   } catch {
     throw new Error(
       `AgentGate is not reachable at ${AGENTGATE_URL}. ` +
-      "Start it in another terminal with: cd ~/Desktop/projects/agentgate && npm run dev",
+      "Start it from your local agentgate checkout using the auth setup described in the README Flagship Demo section.",
     );
   }
 
@@ -286,7 +286,7 @@ main()
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`\nFlagship demo failed: ${detail}`);
     console.error(
-      "If AgentGate is not in open dev mode, export AGENTGATE_REST_KEY or start AgentGate with AGENTGATE_DEV_MODE=true before rerunning.",
+      "Recheck the README Flagship Demo auth guidance: either run AgentGate in local dev mode without a REST key, or export the same AGENTGATE_REST_KEY value before rerunning this demo.",
     );
     await shutdown();
     process.exit(1);

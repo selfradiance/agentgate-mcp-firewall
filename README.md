@@ -153,17 +153,19 @@ This is the shortest newcomer-friendly path through the real governed `write_fil
 
 ### Run it
 
+Assumes you have local checkouts of both `agentgate` and `agentgate-mcp-firewall`; adjust the `cd` paths below to where you cloned them.
+
 In terminal 1:
 
 ```bash
-cd ~/Desktop/projects/agentgate
+cd /path/to/agentgate
 AGENTGATE_DEV_MODE=true npm run dev
 ```
 
 In terminal 2:
 
 ```bash
-cd /Users/jamestoole/Desktop/projects/agentgate-mcp-firewall
+cd /path/to/agentgate-mcp-firewall
 npm install
 npm run demo:write-file
 ```
