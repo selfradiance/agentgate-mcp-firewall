@@ -1,69 +1,144 @@
 # MCP Firewall
 
-A governance proxy for MCP tool calls. The MCP Firewall sits between MCP clients (Claude Desktop, coding agents, browser agents) and MCP servers (tool providers), intercepting every tool call. Before forwarding a call, it verifies the calling agent has an active bond on AgentGate and reserves exposure proportional to the tool's risk tier. Bad outcomes get slashed.
+An MCP governance proxy with AgentGate-backed accountability.
+
+MCP Firewall v0.3.0 makes one narrow claim:
+
+For `write_file` routed to one upstream filesystem-style MCP server, the firewall does not trust upstream-reported success alone. It independently verifies the postcondition on disk and resolves the action from the observed effect.
+
+That means a compromised upstream can claim `"success"` and still be caught when:
+
+- no file was actually written
+- the wrong governed path was written
+- the target path exists but does not contain the requested content
+
+This release is intentionally small. It is a proof-of-concept for one independently checkable effect class, not a general proof against all compromised MCP behavior.
 
 ## Why This Exists
 
-MCP adoption is exploding. Agents can now call arbitrary tools — file systems, databases, APIs, browsers, code execution environments — through a standardized protocol. But there's no enforcement layer between "agent wants to call a tool" and "tool executes." The trust model is binary: either the tool is available or it isn't.
+An MCP client normally has to trust the upstream MCP server's answer about whether a tool call succeeded. That is not a safe assumption for a governance proxy. If the upstream is compromised or dishonest, it can claim success without producing the intended effect, or it can produce a different effect than the one the client requested.
 
-The MCP Firewall is the missing middle layer: the agent can call the tool, but it costs something if the outcome is bad. It is the runtime enforcement point that makes each MCP tool call observable, attributable to a specific agent identity, and consequential — treating every invocation as a security-relevant action rather than an opaque function call.
+v0.3.0 proves that the firewall can govern one high-risk surface without trusting that self-report. The chosen surface is `write_file`, because it is easy to verify mechanically and easy to demonstrate honestly.
 
-## How It Relates to AgentGate
+## v0.3.0 Scope
 
-[AgentGate](https://github.com/selfradiance/agentgate) is the enforcement substrate. The firewall calls AgentGate's API to verify agent identity, check bond status, record actions (tool calls) against bonds, and resolve outcomes. The firewall is a client of AgentGate, not an extension — no changes to AgentGate core were needed.
+In scope for this release:
 
-This is the project that connects the AgentGate ecosystem to what the industry is actually deploying. Agents 001–006 and the Delegation Identity Proof demonstrate the model in controlled environments. The MCP Firewall demonstrates it on live MCP infrastructure.
+- one upstream MCP server
+- one high-risk tool surface: `write_file`
+- one deterministic verifier for filesystem write outcomes
+- honest and dishonest upstream test scenarios
+- structured outcome logging that records the basis for each governed decision
 
-## What It Does
+Not claimed in this release:
 
-The firewall is an MCP proxy. It connects to an upstream MCP server (currently the `@modelcontextprotocol/server-filesystem` server via an HTTP wrapper), discovers its tools, and re-exposes a policy-filtered subset to clients. Only tools listed in the policy are exposed — everything else is silently blocked.
+- generalized attestation
+- anomaly scoring or reputation systems
+- cryptographic proof of remote execution
+- coverage for every filesystem tool
+- protection against all possible upstream side effects
 
-Before any tool call is forwarded, the firewall:
+## What v0.3.0 Verifies
 
-1. **Authenticates the caller** — the agent must prove identity ownership via Ed25519 proof-of-possession, bound to the MCP session.
-2. **Validates the path** — for filesystem tools, the requested path is validated against the governed workspace using `fs.realpathSync()` (defeats symlink escapes) and a separator-appended prefix check (defeats sibling prefix bypass). Both checks are required.
-3. **Records a bonded action** on AgentGate with exposure proportional to the tool's risk tier.
-4. **Forwards the call** to the upstream server.
-5. **Verifies the outcome** — for write operations, the firewall checks that the expected artifact exists on disk after the upstream reports success. Upstream success + missing artifact is resolved as malicious (bond slashed).
+For governed `write_file` calls, the firewall records an intended effect and then verifies it after the upstream returns.
+
+The intended effect is:
+
+- the exact target path should exist as a regular file
+- that file's content hash should match the requested content
+- no other path inside `governed_root` should have changed during the call
+
+The verifier works from the firewall's own filesystem view. It snapshots the governed tree before the upstream call, forwards the request, snapshots again after the upstream returns, and compares the observed effect with the intended one.
+
+## Resolution Policy
+
+v0.3.0 uses a simple deterministic mapping:
+
+- verified intended effect present -> `success`
+- claimed success but intended effect not observed -> `failed`
+- claimed success with a policy-violating observed effect -> `malicious`
+
+Concretely:
+
+- target file missing after upstream success -> `failed`
+- target file content mismatch -> `malicious`
+- wrong governed path changed -> `malicious`
+- verifier internal failure -> `failed`
+
+The firewall returns the governed outcome and, when AgentGate is configured, resolves the bonded action with the same mapping.
+
+## End-to-End Flow
+
+1. The client sends `write_file` to the firewall.
+2. The firewall verifies AgentGate identity and bond state as usual.
+3. The firewall validates that the requested path stays inside `governed_root`.
+4. The firewall records the bonded action.
+5. The firewall snapshots the governed tree and records the intended effect.
+6. The firewall forwards `write_file` to the upstream server.
+7. The upstream returns success or failure.
+8. The firewall independently verifies the postcondition on disk.
+9. The firewall resolves the action from the observed effect, not from the upstream claim alone.
+
+## Demo Scenarios
+
+The repo now includes deterministic coverage for these three scenarios:
+
+1. Honest upstream
+   The upstream returns success, the exact file is written, verification passes, final resolution is `success`.
+2. Lying upstream, no actual effect
+   The upstream returns success, no file appears, verification fails, final resolution is `failed`.
+3. Lying upstream, wrong or forbidden effect
+   The upstream returns success, a different governed path is written, verification detects the unexpected change, final resolution is `malicious`.
+
+There is also a focused failure-path test where the verifier itself throws. In that case the firewall still fails closed and does not treat upstream success as authoritative.
+
+## Audit Trail
+
+For each governed `write_file` decision, the firewall emits a structured `FIREWALL_OUTCOME` log entry with:
+
+- requested tool call
+- intended effect
+- upstream reported status and summary
+- independent verification result
+- final resolution
+- reason code and reason text
+
+This is meant to make each decision inspectable without re-reading raw transport traffic.
 
 ## Architecture
 
 ```
-MCP Client (agent)
-      |
-      | Streamable HTTP
-      v
-+------------------+
-|   MCP Firewall   |  <- authentication, path validation, bond enforcement
-|   (port 5555)    |
-+------------------+
-      |
-      | Streamable HTTP
-      v
-+---------------------+
-| Filesystem Wrapper  |  <- stdio-to-HTTP bridge (test fixture)
-|   (port 4445)       |
-+---------------------+
-      |
-      | stdio
-      v
-+---------------------+
-| @modelcontextprotocol|
-| /server-filesystem   |  <- actual filesystem operations
-+---------------------+
-      |
-      v
-  ~/mcp-firewall-sandbox/   <- governed workspace (0o700)
+MCP Client
+   |
+   | Streamable HTTP
+   v
++------------------------+
+|      MCP Firewall      |
+| auth, bond gate,       |
+| path validation,       |
+| write_file verifier    |
++------------------------+
+   |
+   | Streamable HTTP
+   v
++------------------------+
+| Upstream MCP Server    |
+| filesystem-style tool  |
+| surface                |
++------------------------+
+   |
+   v
+governed_root on disk
 ```
 
-AgentGate runs separately on port 3000 and is called by the firewall for identity verification, bond management, and action recording/resolution.
+For the honest path in tests and local demos, the upstream is `@modelcontextprotocol/server-filesystem` behind the included HTTP wrapper.
 
 ## Quick Start
 
 ### Prerequisites
 
 - Node.js 20+
-- AgentGate running locally (`cd agentgate && npm run dev`)
+- AgentGate running locally if you want bonded resolution behavior
 
 ### 1. Install dependencies
 
@@ -79,34 +154,28 @@ cd ~/Desktop/projects/agentgate && npm run dev
 
 ### 3. Start the filesystem wrapper
 
-The wrapper bridges the filesystem server (stdio-only) to Streamable HTTP so the firewall can connect to it.
+The wrapper bridges the stdio-only filesystem server to Streamable HTTP so the firewall can connect to it.
 
 ```bash
 npx tsx test/fixtures/filesystem-server-wrapper.ts 4445 ~/mcp-firewall-sandbox
 ```
 
-### 4. Create a policy file
-
-Create `policy.json` in the project root:
+### 4. Create a narrow `policy.json`
 
 ```json
 {
   "governed_root": "/Users/yourname/mcp-firewall-sandbox",
   "tools": {
     "write_file": {
-      "tier": "medium",
+      "tier": "high",
       "exposure_cents": 50
-    },
-    "create_directory": {
-      "tier": "low",
-      "exposure_cents": 10
     }
   },
   "default_exposure_cents": 100
 }
 ```
 
-Set `governed_root` to the absolute path of your sandbox directory.
+Use an absolute path for `governed_root`.
 
 ### 5. Start the firewall
 
@@ -115,70 +184,64 @@ npm run dev
 ```
 
 The firewall will:
-- Load the policy
-- Register executor and resolver identities on AgentGate
-- Lock a bond
-- Connect to the upstream wrapper with exponential backoff
-- Filter upstream tools to the policy allowlist
-- Run a canary write probe to verify upstream write access
-- Start listening on port 5555
 
-### Environment variables
+- load the policy
+- create/register executor and resolver identities on AgentGate
+- lock a bond
+- connect to the upstream
+- filter exposed tools to the policy allowlist
+- run a canary `write_file` probe to prove shared write access
+- listen on port `5555`
+
+### 6. Call `write_file`
+
+Use an existing directory inside `governed_root`, or create parent directories out of band first. The upstream filesystem server does not create missing parent directories automatically.
+
+## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
 | `UPSTREAM_MCP_URL` | `http://127.0.0.1:4444/mcp` | Upstream MCP server URL |
-| `FIREWALL_PORT` | `5555` | Port the firewall listens on |
-| `FIREWALL_POLICY_PATH` | `./policy.json` | Path to the policy config file |
-| `FIREWALL_IDENTITY_PATH` | `./agent-identity-firewall.json` | Executor identity keypair file |
-| `RESOLVER_IDENTITY_PATH` | `./agent-identity-resolver.json` | Resolver identity keypair file |
-| `FIREWALL_BOND_CENTS` | `100` | Bond amount in cents |
-| `FIREWALL_BOND_TTL_SECONDS` | `3600` | Bond TTL in seconds |
+| `FIREWALL_PORT` | `5555` | Firewall listen port |
+| `FIREWALL_POLICY_PATH` | `./policy.json` | Policy config path |
+| `FIREWALL_IDENTITY_PATH` | `./agent-identity-firewall.json` | Executor identity file |
+| `RESOLVER_IDENTITY_PATH` | `./agent-identity-resolver.json` | Resolver identity file |
+| `FIREWALL_BOND_CENTS` | `100` | Firewall bond amount in cents |
+| `FIREWALL_BOND_TTL_SECONDS` | `3600` | Firewall bond TTL in seconds |
 | `AGENTGATE_URL` | `http://127.0.0.1:3000` | AgentGate base URL |
-
-## Behavioral Constraints
-
-**You must create parent directories before writing nested files.** The upstream filesystem server does not create intermediate directories automatically. If you call `write_file` with path `~/mcp-firewall-sandbox/subdir/file.txt`, the call will fail unless `subdir` already exists. Call `create_directory` first.
-
-## Known Limitations
-
-These are intentional proof-of-concept tradeoffs, not bugs:
-
-1. **Race condition between path validation and upstream execution.** The firewall validates the path, then forwards the call to the upstream server as two separate steps. A sufficiently fast filesystem change between validation and execution could theoretically alter what the path resolves to. Closing this gap would require atomic validate-and-execute, which the MCP protocol does not support.
-
-2. **Shared filesystem assumption.** The post-call verification (`fs.existsSync` on the resolved path) assumes the firewall process and the upstream filesystem server see the same filesystem. If they run on different machines or in different containers with separate mounts, verification will always fail. This is by design for the single-machine POC.
-
-3. **Same-user assumption.** The firewall secures `governed_root` with `0o700` (owner-only). This only provides isolation if the firewall and upstream run as the same OS user, which they do in the POC configuration. Multi-user or multi-tenant isolation would require OS-level sandboxing (containers, namespaces).
-
-4. **Orphaned upstream on firewall crash.** If the firewall process crashes or is killed without graceful shutdown, the upstream filesystem wrapper continues running. The wrapper has no auth and will accept tool calls from anything that connects. In production, the wrapper would need its own lifecycle management or be supervised alongside the firewall.
-
-5. **Path validation checks `args.path` only.** Tools that use different field names for file paths (e.g., `source`, `destination`) are not protected by the boundary check and must not be added to the policy allowlist without updating the validation logic in `firewall-server.ts`.
-
-## Startup Verification
-
-On startup, the firewall verifies it can write to the governed workspace via the upstream server. It sends a `write_file` call for a canary file (`.mcp-firewall-canary`) through the full MCP chain — firewall to wrapper to filesystem server to disk — then checks that the file actually appeared on disk, then deletes it. If the canary write fails or the file doesn't appear, the firewall refuses to start. This proves functional write access through the entire proxy chain, not just that the upstream is reachable.
 
 ## Tests
 
-71 tests across 14 files. Run with:
+Run the full suite with:
 
 ```bash
 npm test
 ```
 
-Integration tests that require AgentGate skip gracefully with a warning when AgentGate is not running on localhost:3000. Unit tests (path validation, policy loading, upstream client, startup sequence) run without any external dependencies.
+The v0.3.0 work adds focused tests for:
 
-## Scope / Non-Goals
+- honest `write_file` verification success
+- upstream lies with no effect
+- upstream lies with wrong-target write
+- verifier failure path
+- deterministic resolution mapping in the standalone verifier
 
-v0.2.0 explicitly does not:
+Tests that require a local AgentGate instance still skip cleanly when AgentGate is not running.
 
-- **Evaluate file content.** The firewall checks where files are written, not what they contain. Content-based policies (e.g., "don't write credentials to disk") are out of scope.
-- **Support multi-tenant isolation.** One firewall instance governs one workspace for one user. There is no tenant separation, namespace isolation, or per-agent workspace partitioning.
-- **Target production deployment.** This is a proof-of-concept demonstrating that MCP tool calls can be economically governed via bond enforcement. It runs on localhost, uses a test fixture as the transport bridge, and assumes a trusted single-machine environment.
-- **Implement content-addressed verification.** Post-call verification checks existence, not integrity. A future version could hash file contents and compare against expected outputs.
+## What v0.3.0 Still Does Not Solve
+
+This section is deliberate. The repo should not claim more than the implementation proves.
+
+- It verifies one surface only. The sharp v0.3.0 claim is about `write_file`, not every MCP tool.
+- It verifies observable postconditions, not causality. If the target file already contained the requested content before the call, a dishonest no-op is indistinguishable from a real idempotent write.
+- It watches `governed_root`, not the whole machine. A compromised upstream that writes outside the governed tree is out of scope for this verifier unless that behavior also produces an observable governed-tree violation.
+- It assumes the firewall and upstream share the same filesystem view. If they do not share mounts, verification will fail or become meaningless.
+- It assumes no unrelated concurrent writer is modifying `governed_root` during the governed call. Concurrent writes can create false malicious/failure signals because the verifier uses before/after snapshots.
+- It is not a general attestation framework. There is no cryptographic proof that the upstream executed particular code, only an independent check of one observable effect class.
+- It is still a localhost proof-of-concept. Production-grade isolation, supervision, and multi-tenant containment are out of scope here.
 
 ## Related Projects
 
-- [AgentGate](https://github.com/selfradiance/agentgate) — the bond-and-slash enforcement substrate
-- [AgentGate Agents](https://github.com/selfradiance/agentgate-agents) — reference agent implementations (001–006)
-- [Delegation Identity Proof](https://github.com/selfradiance/delegation-identity-proof) — Ed25519 identity delegation demonstration
+- [AgentGate](https://github.com/selfradiance/agentgate) — bond-and-slash enforcement substrate
+- [AgentGate Agents](https://github.com/selfradiance/agentgate-agents) — reference agent implementations
+- [Delegation Identity Proof](https://github.com/selfradiance/delegation-identity-proof) — Ed25519 delegation demonstration

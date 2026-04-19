@@ -20,6 +20,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
+  type CallToolResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { UpstreamClient } from "./upstream-client.js";
@@ -27,6 +28,12 @@ import type { AgentGateClient } from "./agentgate-client.js";
 import type { PolicyConfig } from "./policy.js";
 import { getExposure } from "./policy.js";
 import { AUTHENTICATION_EXPOSURE_CENTS } from "./authentication.js";
+import {
+  FilesystemWriteFileVerifier,
+  type WriteFileVerificationPlan,
+  type WriteFileVerificationResult,
+  type WriteFileVerifier,
+} from "./write-file-verifier.js";
 
 const MAX_PAYLOAD_BYTES = 4000;
 const DEFAULT_MAX_SESSIONS = 1000;
@@ -61,6 +68,32 @@ function sanitizePayload(payload: Record<string, unknown>): Record<string, unkno
   return withoutArgs;
 }
 
+function truncateText(value: string, maxLength = 240): string {
+  return value.length > maxLength
+    ? value.slice(0, maxLength) + "...[truncated]"
+    : value;
+}
+
+function summarizeToolResult(result: CallToolResult | undefined): string {
+  if (!result) {
+    return "no upstream result";
+  }
+
+  const textParts: string[] = [];
+
+  for (const item of result.content ?? []) {
+    if (item.type === "text" && typeof item.text === "string") {
+      textParts.push(item.text);
+    }
+  }
+
+  if (textParts.length > 0) {
+    return truncateText(textParts.join(" | "));
+  }
+
+  return result.isError ? "upstream returned an error" : "upstream returned success";
+}
+
 export type PathValidationResult =
   | { status: "valid"; resolvedPath: string }
   | { status: "malicious" };
@@ -68,6 +101,30 @@ export type PathValidationResult =
 type GovernedArgsValidationResult =
   | { status: "valid"; verificationPath?: string }
   | { status: "malicious"; attemptedPath: string };
+
+type GovernedResolution = "success" | "failed" | "malicious";
+
+interface OutcomeAuditEntry {
+  requestedToolCall: {
+    name: string;
+    arguments: unknown;
+  };
+  intendedEffect: Record<string, unknown> | null;
+  upstreamReported: {
+    status: "success" | "error" | "not_called";
+    summary: string;
+  };
+  verification: {
+    status: string;
+    reasonCode: string;
+    message: string;
+    changedPaths?: string[];
+    unexpectedPaths?: string[];
+  };
+  finalResolution: GovernedResolution;
+  reasonCode: string;
+  reason: string;
+}
 
 /**
  * Validate that a requested path is inside the governed root.
@@ -214,6 +271,8 @@ export interface FirewallServerOptions {
   maxSessions?: number;
   /** Host/interface to bind to (default: "127.0.0.1"). Set to "0.0.0.0" to accept connections from all interfaces. */
   host?: string;
+  /** Optional override for write_file postcondition verification. Primarily used by tests. */
+  writeFileVerifier?: WriteFileVerifier;
 }
 
 interface SessionAuth {
@@ -274,6 +333,7 @@ export class FirewallServer {
   private firewallBondId: string | undefined;
   private sessionTtlMs: number;
   private maxSessions: number;
+  private writeFileVerifier: WriteFileVerifier;
   private sessionAuth = new Map<string, SessionAuth>();
   private transports = new Map<string, StreamableHTTPServerTransport>();
 
@@ -287,6 +347,7 @@ export class FirewallServer {
     this.firewallBondId = options.firewallBondId;
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
+    this.writeFileVerifier = options.writeFileVerifier ?? new FilesystemWriteFileVerifier();
   }
 
   /** Whether authentication is required (AgentGate client was provided). */
@@ -549,7 +610,7 @@ export class FirewallServer {
   /** Create a low-level MCP Server that proxies tool calls to the upstream. */
   private createServer(transport: StreamableHTTPServerTransport): Server {
     const server = new Server(
-      { name: "mcp-firewall", version: "0.2.1" },
+      { name: "mcp-firewall", version: "0.3.0" },
       { capabilities: { tools: {} } },
     );
 
@@ -696,20 +757,127 @@ export class FirewallServer {
    *
    * Outcome rules:
    *   - Upstream error (MCP-level or transport) → resolve as "failed" (bond released)
-   *   - Upstream success + resolvedPath provided + artifact exists → resolve as "success" (bond released)
-   *   - Upstream success + resolvedPath provided + artifact missing → resolve as "malicious" (bond slashed)
-   *   - Upstream success + no resolvedPath (non-governed tool) → action stays open for external review
-   *   - Unclassifiable state → resolve as "malicious" (conservative default)
+   *   - Governed write_file success + verified target content/no extra writes → resolve as "success"
+   *   - Governed write_file success + missing intended effect → resolve as "failed"
+   *   - Governed write_file success + wrong target/content or extra writes → resolve as "malicious"
+   *   - Governed verifier failure → resolve as "failed"
+   *   - Other governed tools keep the legacy artifact-exists check for now
    *
-   * @param resolvedPath Canonical path from validatePath. Used for post-call fs.existsSync() verification.
+   * @param resolvedPath Canonical path from validatePath. Used for governed verification.
    */
+  private emitOutcomeAuditLog(entry: OutcomeAuditEntry): void {
+    console.log(`FIREWALL_OUTCOME ${JSON.stringify(entry)}`);
+  }
+
+  private async resolveGovernedAction(
+    actionId: string,
+    resolution: GovernedResolution,
+    context: string,
+  ): Promise<void> {
+    if (!this.resolverClient) {
+      return;
+    }
+
+    try {
+      await this.resolverClient.resolveAction(actionId, resolution);
+    } catch (resolveError) {
+      const message =
+        resolveError instanceof Error
+          ? resolveError.message
+          : String(resolveError);
+      console.error(`Failed to resolve action ${actionId} during ${context}: ${message}`);
+    }
+  }
+
+  private buildWriteFilePlan(
+    args: Record<string, unknown>,
+    resolvedPath: string,
+  ): WriteFileVerificationPlan {
+    if (!this.policy?.governed_root) {
+      throw new Error("governed_root is required for write_file verification");
+    }
+
+    if (typeof args.content !== "string") {
+      throw new Error("write_file requires a string content field for verification");
+    }
+
+    return this.writeFileVerifier.prepare({
+      governedRoot: this.policy.governed_root,
+      targetPath: resolvedPath,
+      content: args.content,
+    });
+  }
+
   private async forwardWithVerification(
     toolName: string,
     args: Record<string, unknown>,
     actionId: string,
     resolvedPath?: string,
   ) {
-    let result: Awaited<ReturnType<typeof this.upstream.callTool>>;
+    const requestedToolCall = sanitizePayload({
+      name: toolName,
+      arguments: args,
+    });
+    let writeFilePlan: WriteFileVerificationPlan | undefined;
+    let writeFileIntent: Record<string, unknown> | null = null;
+
+    if (toolName === "write_file" && resolvedPath) {
+      writeFileIntent = {
+        type: "write_file",
+        targetPath: resolvedPath,
+        expectedContentBytes:
+          typeof args.content === "string"
+            ? Buffer.byteLength(args.content, "utf-8")
+            : undefined,
+      };
+
+      try {
+        writeFilePlan = this.buildWriteFilePlan(args, resolvedPath);
+        writeFileIntent = {
+          ...writeFileIntent,
+          expectedContentSha256: writeFilePlan.expectedContentSha256,
+        };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await this.resolveGovernedAction(
+          actionId,
+          "failed",
+          "write_file verification preparation failure",
+        );
+        this.emitOutcomeAuditLog({
+          requestedToolCall: {
+            name: toolName,
+            arguments: requestedToolCall.arguments,
+          },
+          intendedEffect: writeFileIntent,
+          upstreamReported: {
+            status: "not_called",
+            summary: "upstream not called because verification preparation failed",
+          },
+          verification: {
+            status: "verifier_error",
+            reasonCode: "verification_prepare_failed",
+            message: detail,
+          },
+          finalResolution: "failed",
+          reasonCode: "verification_prepare_failed",
+          reason: detail,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "write_file could not be verified before forwarding. " +
+                "Upstream success was not trusted, and the action was resolved as failed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    let result: CallToolResult | undefined;
     let failed = false;
     let errorMessage = "";
 
@@ -725,7 +893,6 @@ export class FirewallServer {
         errorMessage = firstContent?.text ?? "Upstream tool returned an error";
       }
     } catch (error) {
-      // Transport/network error
       failed = true;
       errorMessage =
         error instanceof Error ? error.message : "Unknown upstream error";
@@ -735,18 +902,29 @@ export class FirewallServer {
       };
     }
 
-    // Outcome: upstream error → resolve as "failed" (bond released)
-    if (failed && this.resolverClient) {
-      try {
-        await this.resolverClient.resolveAction(actionId, "failed");
-      } catch (resolveError) {
-        const resolveMsg =
-          resolveError instanceof Error
-            ? resolveError.message
-            : "Unknown resolve error";
-        console.error(
-          `Failed to resolve action ${actionId} after upstream error: ${resolveMsg}`,
-        );
+    if (failed) {
+      await this.resolveGovernedAction(actionId, "failed", "upstream failure");
+
+      if (writeFilePlan) {
+        this.emitOutcomeAuditLog({
+          requestedToolCall: {
+            name: toolName,
+            arguments: requestedToolCall.arguments,
+          },
+          intendedEffect: writeFileIntent,
+          upstreamReported: {
+            status: "error",
+            summary: summarizeToolResult(result),
+          },
+          verification: {
+            status: "not_run",
+            reasonCode: "upstream_error",
+            message: "Independent verification was skipped because the upstream failed.",
+          },
+          finalResolution: "failed",
+          reasonCode: "upstream_error",
+          reason: errorMessage,
+        });
       }
 
       return {
@@ -760,30 +938,128 @@ export class FirewallServer {
       };
     }
 
-    // Post-call verification for governed filesystem tools
-    if (!failed && resolvedPath && this.resolverClient) {
+    if (writeFilePlan) {
+      let verification: WriteFileVerificationResult;
+
+      try {
+        verification = this.writeFileVerifier.verify(writeFilePlan);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await this.resolveGovernedAction(
+          actionId,
+          "failed",
+          "write_file verification execution failure",
+        );
+        this.emitOutcomeAuditLog({
+          requestedToolCall: {
+            name: toolName,
+            arguments: requestedToolCall.arguments,
+          },
+          intendedEffect: writeFileIntent,
+          upstreamReported: {
+            status: "success",
+            summary: summarizeToolResult(result),
+          },
+          verification: {
+            status: "verifier_error",
+            reasonCode: "verification_execution_failed",
+            message: detail,
+          },
+          finalResolution: "failed",
+          reasonCode: "verification_execution_failed",
+          reason: detail,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Independent outcome verification failed after the upstream returned success. " +
+                "Upstream success was not trusted, and the action was resolved as failed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      await this.resolveGovernedAction(
+        actionId,
+        verification.resolution,
+        `write_file verification (${verification.reasonCode})`,
+      );
+      this.emitOutcomeAuditLog({
+        requestedToolCall: {
+          name: toolName,
+          arguments: requestedToolCall.arguments,
+        },
+        intendedEffect: writeFileIntent,
+        upstreamReported: {
+          status: "success",
+          summary: summarizeToolResult(result),
+        },
+        verification: {
+          status: verification.status,
+          reasonCode: verification.reasonCode,
+          message: verification.message,
+          changedPaths: verification.changedPaths,
+          unexpectedPaths: verification.unexpectedPaths,
+        },
+        finalResolution: verification.resolution,
+        reasonCode: verification.reasonCode,
+        reason: verification.message,
+      });
+
+      if (verification.resolution === "success") {
+        return result!;
+      }
+
+      if (verification.resolution === "failed") {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Tool call completed but the intended file effect was not independently observed. " +
+                "Action resolved as failed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Tool call completed but independent verification detected a policy-violating file effect. " +
+              "Action resolved as malicious.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    // Legacy post-call verification for other governed filesystem tools.
+    if (resolvedPath && this.resolverClient) {
       const artifactExists = fs.existsSync(resolvedPath);
 
       if (artifactExists) {
-        // Outcome: upstream success + artifact confirmed → resolve as "success"
-        try {
-          await this.resolverClient.resolveAction(actionId, "success");
-        } catch (resolveError) {
-          const msg = resolveError instanceof Error ? resolveError.message : String(resolveError);
-          console.error(`Failed to resolve action ${actionId} as success: ${msg}`);
-        }
+        await this.resolveGovernedAction(
+          actionId,
+          "success",
+          "legacy governed artifact verification",
+        );
       } else {
-        // Outcome: upstream success + artifact missing → anomaly → resolve as "malicious"
         console.error(
           `Post-call verification failed: upstream reported success for "${toolName}" ` +
           `but artifact not found at "${resolvedPath}". Resolving as malicious.`,
         );
-        try {
-          await this.resolverClient.resolveAction(actionId, "malicious");
-        } catch (resolveError) {
-          const msg = resolveError instanceof Error ? resolveError.message : String(resolveError);
-          console.error(`Failed to resolve action ${actionId} as malicious: ${msg}`);
-        }
+        await this.resolveGovernedAction(
+          actionId,
+          "malicious",
+          "legacy governed artifact verification",
+        );
 
         return {
           content: [

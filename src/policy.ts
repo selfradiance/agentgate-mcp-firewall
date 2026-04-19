@@ -16,7 +16,7 @@ export interface ToolPolicy {
 export interface PolicyConfig {
   tools: Record<string, ToolPolicy>;
   default_exposure_cents: number;
-  /** Absolute path to the governed workspace directory (required for v0.2+ filesystem governance). */
+  /** Absolute path to the governed workspace directory used for governed filesystem verification. */
   governed_root?: string;
 }
 

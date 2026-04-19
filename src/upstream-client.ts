@@ -47,7 +47,7 @@ export class UpstreamClient {
   constructor(private options: UpstreamClientOptions) {
     this.client = new Client({
       name: options.clientName ?? "mcp-firewall",
-      version: options.clientVersion ?? "0.1.0",
+      version: options.clientVersion ?? "0.3.0",
     });
 
     this.transport = new StreamableHTTPClientTransport(
