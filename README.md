@@ -14,6 +14,8 @@ That means a compromised upstream can claim `"success"` and still be caught when
 
 This release is intentionally small. It is a proof-of-concept for one independently checkable effect class, not a general proof against all compromised MCP behavior.
 
+If you want the fastest proof path, jump to [First Run: Flagship Demo](#first-run-flagship-demo) and run `npm run demo:write-file`.
+
 ## Why This Exists
 
 An MCP client normally has to trust the upstream MCP server's answer about whether a tool call succeeded. That is not a safe assumption for a governance proxy. If the upstream is compromised or dishonest, it can claim success without producing the intended effect, or it can produce a different effect than the one the client requested.
@@ -133,9 +135,11 @@ governed_root on disk
 
 For the honest path in tests and local demos, the upstream is `@modelcontextprotocol/server-filesystem` behind the included HTTP wrapper.
 
-## Flagship Demo
+## First Run: Flagship Demo
 
-This is the shortest newcomer-friendly path through the real governed `write_file` flow. It reuses the same happy-path sequence already proven in the filesystem end-to-end test:
+This is the default path for a newcomer. If you only run one thing in this repo, run this demo.
+
+It is the shortest honest path through the real governed `write_file` flow. It reuses the same happy-path sequence already proven in the filesystem end-to-end test:
 
 - start the filesystem wrapper
 - start MCP Firewall with a `write_file`-only policy
@@ -144,6 +148,12 @@ This is the shortest newcomer-friendly path through the real governed `write_fil
 - authenticate the MCP session with a signed `authenticate` call
 - call governed `write_file`
 - verify the written file on disk while the firewall emits the real `FIREWALL_OUTCOME` audit log
+
+One successful run gives you three inspectable artifacts in one session:
+
+- the raw `FIREWALL_OUTCOME` line from the firewall process
+- a parsed copy of that outcome entry saved to `./data/flagship-demo/last-firewall-outcome.json`
+- the written file at `~/mcp-firewall-sandbox/flagship-demo-output.txt` by default
 
 ### Prerequisites
 
@@ -155,14 +165,14 @@ This is the shortest newcomer-friendly path through the real governed `write_fil
 
 Assumes you have local checkouts of both `agentgate` and `agentgate-mcp-firewall`; adjust the `cd` paths below to where you cloned them.
 
-In terminal 1:
+Terminal 1:
 
 ```bash
 cd /path/to/agentgate
 AGENTGATE_DEV_MODE=true npm run dev
 ```
 
-In terminal 2:
+Terminal 2:
 
 ```bash
 cd /path/to/agentgate-mcp-firewall
@@ -190,14 +200,19 @@ The demo script:
 - starts the filesystem wrapper internally, so you do not need a separate wrapper terminal
 - starts the firewall internally, so you do not need a hand-written `policy.json`
 - stores temporary demo identity files under `./data/flagship-demo/`
+- saves the last governed `FIREWALL_OUTCOME` entry to `./data/flagship-demo/last-firewall-outcome.json`
 - writes `~/mcp-firewall-sandbox/flagship-demo-output.txt` by default
+- fails if the file on disk, the captured audit entry, or the final governed resolution do not agree
 - leaves the written file in place so you can inspect it after the demo exits
 
-What to expect:
+### What you should see
 
-- the firewall logs a `FIREWALL_OUTCOME` line with `"finalResolution":"success"`
+- the firewall logs one real `FIREWALL_OUTCOME` line for the governed `write_file` call
+- the demo prints a short evidence summary showing `upstreamReported.status: success`, `verification.status: verified`, and `finalResolution: success`
+- the saved JSON audit copy at `./data/flagship-demo/last-firewall-outcome.json` matches that same governed call
 - the target file exists on disk with the exact requested content
 - the demo uses the real signed `authenticate` flow before calling `write_file`
+- the important point is not just that the file exists; it is that the firewall resolved the action from the observed disk effect after the MCP call
 
 ## Manual Startup (Optional)
 
