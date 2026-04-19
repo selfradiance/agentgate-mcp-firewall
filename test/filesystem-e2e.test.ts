@@ -11,11 +11,11 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterAll, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { startFilesystemWrapper } from "./fixtures/filesystem-server-wrapper.js";
-import { startPhantomServer } from "./fixtures/phantom-server.js";
+import { startCompromisedWriteServer } from "./fixtures/compromised-write-server.js";
 import { FirewallServer } from "../src/firewall-server.js";
 import { AgentGateClient } from "../src/agentgate-client.js";
 import type { PolicyConfig } from "../src/policy.js";
@@ -106,7 +106,7 @@ describe("filesystem governance e2e", () => {
   let agentBondId: string;
   let executorBondId: string;
 
-  beforeAll(async () => {
+  beforeEach(async () => {
     running = await isAgentGateRunning();
     if (!running) {
       console.warn(
@@ -214,7 +214,7 @@ describe("filesystem governance e2e", () => {
     }
   });
 
-  afterAll(async () => {
+  afterEach(async () => {
     if (!running) return;
     if (client) await client.close();
     if (firewall) await firewall.stop();
@@ -480,10 +480,20 @@ describe("filesystem governance: upstream error handling", () => {
     const { z } = await import("zod");
 
     const mcpServer = new McpServer({ name: "error-fs-server", version: "1.0.0" });
-    mcpServer.tool("write_file", "Always fails", {
+    mcpServer.tool("write_file", "Fails after allowing the startup canary", {
       path: z.string(),
       content: z.string(),
-    }, async () => { throw new Error("Deliberate upstream write failure"); });
+    }, async ({ path: requestedPath, content }) => {
+      if (path.basename(requestedPath) === ".mcp-firewall-canary") {
+        fs.mkdirSync(path.dirname(requestedPath), { recursive: true });
+        fs.writeFileSync(requestedPath, content, "utf-8");
+        return {
+          content: [{ type: "text", text: "Successfully wrote canary file" }],
+        };
+      }
+
+      throw new Error("Deliberate upstream write failure");
+    });
     mcpServer.tool("create_directory", "Always fails", {
       path: z.string(),
     }, async () => { throw new Error("Deliberate upstream mkdir failure"); });
@@ -589,11 +599,11 @@ describe("filesystem governance: upstream error handling", () => {
   });
 });
 
-// --- Test Case 8: Upstream success + file missing → malicious ---
+// --- Test Case 8: Upstream success + file missing → failed ---
 // Uses the phantom server (reports success without writing)
 describe("filesystem governance: anomaly detection", () => {
   let running: boolean;
-  let phantomHttpServer: http.Server;
+  let compromisedHttpServer: http.Server;
   let firewall: FirewallServer;
   let client: Client;
   let transport: StreamableHTTPClientTransport;
@@ -653,13 +663,16 @@ describe("filesystem governance: anomaly detection", () => {
     const agentBond = await agentClient.lockBond(agentIdentityId, 100, "USD", 3600, "phantom-agent");
     agentBondId = agentBond.bondId;
 
-    // Start phantom server (returns success without writing)
-    const phantom = await startPhantomServer(PHANTOM_PORT);
-    phantomHttpServer = phantom.server;
+    // Start compromised server: canary succeeds, real writes silently noop.
+    const compromised = await startCompromisedWriteServer(PHANTOM_PORT, {
+      governedRoot: SANDBOX,
+      mode: "noop",
+    });
+    compromisedHttpServer = compromised.server;
 
     firewall = new FirewallServer({
       port: FIREWALL_PORT + 20,
-      upstreamUrl: phantom.url,
+      upstreamUrl: compromised.url,
       agentgateClient: executorClient,
       resolverClient,
       policy: {
@@ -695,15 +708,15 @@ describe("filesystem governance: anomaly detection", () => {
     if (!running) return;
     if (client) await client.close();
     if (firewall) await firewall.stop();
-    if (phantomHttpServer) {
+    if (compromisedHttpServer) {
       await new Promise<void>((resolve, reject) => {
-        phantomHttpServer.close((err) => (err ? reject(err) : resolve()));
+        compromisedHttpServer.close((err) => (err ? reject(err) : resolve()));
       });
     }
     cleanupPhantomFiles();
   });
 
-  it("upstream success + file missing → malicious (bond slashed)", async () => {
+  it("upstream success + file missing → failed after runtime verification", async () => {
     if (!running) return;
 
     const testFile = path.join(SANDBOX, "phantom-test.txt");
@@ -719,8 +732,8 @@ describe("filesystem governance: anomaly detection", () => {
     // The firewall should detect the anomaly and return an error
     expect(result.isError).toBe(true);
     const text = (result.content as Array<{ type: string; text: string }>)[0].text;
-    expect(text).toMatch(/verification failed/i);
-    expect(text).toMatch(/slashed/i);
+    expect(text).toMatch(/intended file effect was not independently observed/i);
+    expect(text).toMatch(/resolved as failed/i);
 
     // File should still not exist
     expect(fs.existsSync(testFile)).toBe(false);
