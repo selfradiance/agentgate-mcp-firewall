@@ -21,7 +21,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-const DEFAULT_PORT = 4445;
+const DEFAULT_PORT = 4444;
 
 /** Resolve the filesystem server entry point from the installed package. */
 function resolveFilesystemServerBin(): string {
@@ -33,7 +33,7 @@ function resolveFilesystemServerBin(): string {
 }
 
 export interface FilesystemWrapperOptions {
-  /** Port to listen on (default: 4445) */
+  /** Port to listen on (default: 4444) */
   port?: number;
   /** Allowed directory for the filesystem server */
   allowedDir: string;

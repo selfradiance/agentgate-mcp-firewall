@@ -133,12 +133,79 @@ governed_root on disk
 
 For the honest path in tests and local demos, the upstream is `@modelcontextprotocol/server-filesystem` behind the included HTTP wrapper.
 
-## Quick Start
+## Flagship Demo
+
+This is the shortest newcomer-friendly path through the real governed `write_file` flow. It reuses the same happy-path sequence already proven in the filesystem end-to-end test:
+
+- start the filesystem wrapper
+- start MCP Firewall with a `write_file`-only policy
+- register executor, resolver, and client identities on AgentGate
+- lock executor and client bonds
+- authenticate the MCP session with a signed `authenticate` call
+- call governed `write_file`
+- verify the written file on disk while the firewall emits the real `FIREWALL_OUTCOME` audit log
 
 ### Prerequisites
 
 - Node.js 20+
-- AgentGate running locally if you want bonded resolution behavior
+- AgentGate running locally at `http://127.0.0.1:3000`
+- `AGENTGATE_REST_KEY` exported only if your AgentGate instance requires a REST key
+
+### Run it
+
+In terminal 1:
+
+```bash
+cd ~/Desktop/projects/agentgate
+AGENTGATE_DEV_MODE=true npm run dev
+```
+
+In terminal 2:
+
+```bash
+cd /Users/jamestoole/Desktop/projects/agentgate-mcp-firewall
+npm install
+npm run demo:write-file
+```
+
+If your AgentGate repo already has `AGENTGATE_REST_KEY` configured, export the same value in terminal 2 before running the demo:
+
+```bash
+export AGENTGATE_REST_KEY=your-key-here
+npm run demo:write-file
+```
+
+`AGENTGATE_DEV_MODE=true` only skips REST auth when AgentGate starts without a REST key already configured. If you already run AgentGate with a valid REST key and do not need dev mode, plain `npm run dev` on the AgentGate repo also works.
+
+If ports `4444` or `5555` are already in use:
+
+```bash
+DEMO_WRAPPER_PORT=4480 DEMO_FIREWALL_PORT=5580 npm run demo:write-file
+```
+
+The demo script:
+
+- starts the filesystem wrapper internally, so you do not need a separate wrapper terminal
+- starts the firewall internally, so you do not need a hand-written `policy.json`
+- stores temporary demo identity files under `./data/flagship-demo/`
+- writes `~/mcp-firewall-sandbox/flagship-demo-output.txt` by default
+- leaves the written file in place so you can inspect it after the demo exits
+
+What to expect:
+
+- the firewall logs a `FIREWALL_OUTCOME` line with `"finalResolution":"success"`
+- the target file exists on disk with the exact requested content
+- the demo uses the real signed `authenticate` flow before calling `write_file`
+
+## Manual Startup (Optional)
+
+Use this only if you want to start the wrapper and firewall yourself. If you want one clean end-to-end demo, use the Flagship Demo above.
+
+### Prerequisites
+
+- Node.js 20+
+- AgentGate running locally
+- `AGENTGATE_REST_KEY` exported only if your AgentGate instance requires a REST key
 
 ### 1. Install dependencies
 
@@ -149,7 +216,7 @@ npm install
 ### 2. Start AgentGate
 
 ```bash
-cd ~/Desktop/projects/agentgate && npm run dev
+cd ~/Desktop/projects/agentgate && AGENTGATE_DEV_MODE=true npm run dev
 ```
 
 ### 3. Start the filesystem wrapper
@@ -157,7 +224,7 @@ cd ~/Desktop/projects/agentgate && npm run dev
 The wrapper bridges the stdio-only filesystem server to Streamable HTTP so the firewall can connect to it.
 
 ```bash
-npx tsx test/fixtures/filesystem-server-wrapper.ts 4445 ~/mcp-firewall-sandbox
+npx tsx test/fixtures/filesystem-server-wrapper.ts 4444 ~/mcp-firewall-sandbox
 ```
 
 ### 4. Create a narrow `policy.json`
@@ -193,9 +260,21 @@ The firewall will:
 - run a canary `write_file` probe to prove shared write access
 - listen on port `5555`
 
-### 6. Call `write_file`
+### 6. Connect a real MCP client and call `write_file`
 
 Use an existing directory inside `governed_root`, or create parent directories out of band first. The upstream filesystem server does not create missing parent directories automatically.
+
+A real client call sequence is:
+
+1. Connect to `http://127.0.0.1:5555/mcp`
+2. Call `authenticate` with signed arguments from `AgentGateClient.createAuthenticationArguments(...)`
+3. Call `write_file`
+
+If you want a working example of that authenticated client flow, run:
+
+```bash
+npm run demo:write-file
+```
 
 ## Environment Variables
 
@@ -209,6 +288,7 @@ Use an existing directory inside `governed_root`, or create parent directories o
 | `FIREWALL_BOND_CENTS` | `100` | Firewall bond amount in cents |
 | `FIREWALL_BOND_TTL_SECONDS` | `3600` | Firewall bond TTL in seconds |
 | `AGENTGATE_URL` | `http://127.0.0.1:3000` | AgentGate base URL |
+| `AGENTGATE_REST_KEY` | unset | Optional REST key for AgentGate instances that are not running in open dev mode |
 
 ## Tests
 

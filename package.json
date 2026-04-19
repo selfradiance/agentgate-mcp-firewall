@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "demo:write-file": "tsx demo/flagship-write-file.ts",
     "test": "vitest run",
     "build": "tsc"
   },
