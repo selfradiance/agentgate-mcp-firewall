@@ -349,4 +349,5 @@ This section is deliberate. The repo should not claim more than the implementati
 
 - [AgentGate](https://github.com/selfradiance/agentgate) — bond-and-slash enforcement substrate
 - [AgentGate Agents](https://github.com/selfradiance/agentgate-agents) — reference agent implementations
+- [Governed WriteFile Demo](https://github.com/selfradiance/agentgate-governed-writefile-demo) — tiny companion demo repo showing the smallest outsider-readable path through AgentGate + MCP Firewall: identity -> bond -> authenticated governed `write_file` -> independent on-disk verification -> audit artifact
 - [Delegation Identity Proof](https://github.com/selfradiance/delegation-identity-proof) — Ed25519 delegation demonstration
