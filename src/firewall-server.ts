@@ -29,6 +29,13 @@ import type { PolicyConfig } from "./policy.js";
 import { getExposure } from "./policy.js";
 import { AUTHENTICATION_EXPOSURE_CENTS } from "./authentication.js";
 import {
+  DeleteFilePreparationError,
+  FilesystemDeleteFileVerifier,
+  type DeleteFileVerificationPlan,
+  type DeleteFileVerificationResult,
+  type DeleteFileVerifier,
+} from "./delete-file-verifier.js";
+import {
   FilesystemWriteFileVerifier,
   type WriteFileVerificationPlan,
   type WriteFileVerificationResult,
@@ -273,6 +280,8 @@ export interface FirewallServerOptions {
   host?: string;
   /** Optional override for write_file postcondition verification. Primarily used by tests. */
   writeFileVerifier?: WriteFileVerifier;
+  /** Optional override for delete_file postcondition verification. Primarily used by tests. */
+  deleteFileVerifier?: DeleteFileVerifier;
 }
 
 interface SessionAuth {
@@ -334,6 +343,7 @@ export class FirewallServer {
   private sessionTtlMs: number;
   private maxSessions: number;
   private writeFileVerifier: WriteFileVerifier;
+  private deleteFileVerifier: DeleteFileVerifier;
   private sessionAuth = new Map<string, SessionAuth>();
   private transports = new Map<string, StreamableHTTPServerTransport>();
 
@@ -348,6 +358,7 @@ export class FirewallServer {
     this.sessionTtlMs = options.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.maxSessions = options.maxSessions ?? DEFAULT_MAX_SESSIONS;
     this.writeFileVerifier = options.writeFileVerifier ?? new FilesystemWriteFileVerifier();
+    this.deleteFileVerifier = options.deleteFileVerifier ?? new FilesystemDeleteFileVerifier();
   }
 
   /** Whether authentication is required (AgentGate client was provided). */
@@ -709,6 +720,7 @@ export class FirewallServer {
             // Sequential: execute → resolve('malicious') → return error.
             // Both must complete before the client gets a response.
             return this.handlePreflightRejection(
+              name,
               session,
               pathResult.attemptedPath,
             );
@@ -760,6 +772,9 @@ export class FirewallServer {
    *   - Governed write_file success + verified target content/no extra writes → resolve as "success"
    *   - Governed write_file success + missing intended effect → resolve as "failed"
    *   - Governed write_file success + wrong target/content or extra writes → resolve as "malicious"
+   *   - Governed delete_file success + exact target deletion/no extra changes → resolve as "success"
+   *   - Governed delete_file success + target still present unchanged → resolve as "failed"
+   *   - Governed delete_file success + target mutated/wrong type or extra changes → resolve as "malicious"
    *   - Governed verifier failure → resolve as "failed"
    *   - Other governed tools keep the legacy artifact-exists check for now
    *
@@ -808,6 +823,17 @@ export class FirewallServer {
     });
   }
 
+  private buildDeleteFilePlan(resolvedPath: string): DeleteFileVerificationPlan {
+    if (!this.policy?.governed_root) {
+      throw new Error("governed_root is required for delete_file verification");
+    }
+
+    return this.deleteFileVerifier.prepare({
+      governedRoot: this.policy.governed_root,
+      targetPath: resolvedPath,
+    });
+  }
+
   private async forwardWithVerification(
     toolName: string,
     args: Record<string, unknown>,
@@ -820,6 +846,8 @@ export class FirewallServer {
     });
     let writeFilePlan: WriteFileVerificationPlan | undefined;
     let writeFileIntent: Record<string, unknown> | null = null;
+    let deleteFilePlan: DeleteFileVerificationPlan | undefined;
+    let deleteFileIntent: Record<string, unknown> | null = null;
 
     if (toolName === "write_file" && resolvedPath) {
       writeFileIntent = {
@@ -877,6 +905,68 @@ export class FirewallServer {
       }
     }
 
+    if (toolName === "delete_file" && resolvedPath) {
+      deleteFileIntent = {
+        type: "delete_file",
+        targetPath: resolvedPath,
+        requiredPreState: "existing_regular_file",
+        preStateObserved: true,
+        preStateTargetKind: "file",
+      };
+
+      try {
+        deleteFilePlan = this.buildDeleteFilePlan(resolvedPath);
+        deleteFileIntent = {
+          ...deleteFileIntent,
+          preStateTargetSha256: deleteFilePlan.beforeTarget.sha256,
+          preStateTargetBytes: deleteFilePlan.beforeTarget.sizeBytes,
+        };
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const reasonCode =
+          error instanceof DeleteFilePreparationError
+            ? error.reasonCode
+            : "verification_prepare_failed";
+        const clientMessage =
+          error instanceof DeleteFilePreparationError
+            ? error.clientMessage
+            : "delete_file could not be verified before forwarding. Action resolved as failed.";
+        await this.resolveGovernedAction(
+          actionId,
+          "failed",
+          "delete_file verification preparation failure",
+        );
+        this.emitOutcomeAuditLog({
+          requestedToolCall: {
+            name: toolName,
+            arguments: requestedToolCall.arguments,
+          },
+          intendedEffect: deleteFileIntent,
+          upstreamReported: {
+            status: "not_called",
+            summary: "upstream not called because verification preparation failed",
+          },
+          verification: {
+            status: "not_run",
+            reasonCode,
+            message: detail,
+          },
+          finalResolution: "failed",
+          reasonCode,
+          reason: detail,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: clientMessage,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     let result: CallToolResult | undefined;
     let failed = false;
     let errorMessage = "";
@@ -905,13 +995,13 @@ export class FirewallServer {
     if (failed) {
       await this.resolveGovernedAction(actionId, "failed", "upstream failure");
 
-      if (writeFilePlan) {
+      if (writeFilePlan || deleteFilePlan) {
         this.emitOutcomeAuditLog({
           requestedToolCall: {
             name: toolName,
             arguments: requestedToolCall.arguments,
           },
-          intendedEffect: writeFileIntent,
+          intendedEffect: writeFileIntent ?? deleteFileIntent,
           upstreamReported: {
             status: "error",
             summary: summarizeToolResult(result),
@@ -1040,6 +1130,108 @@ export class FirewallServer {
       };
     }
 
+    if (deleteFilePlan) {
+      let verification: DeleteFileVerificationResult;
+
+      try {
+        verification = this.deleteFileVerifier.verify(deleteFilePlan);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        await this.resolveGovernedAction(
+          actionId,
+          "failed",
+          "delete_file verification execution failure",
+        );
+        this.emitOutcomeAuditLog({
+          requestedToolCall: {
+            name: toolName,
+            arguments: requestedToolCall.arguments,
+          },
+          intendedEffect: deleteFileIntent,
+          upstreamReported: {
+            status: "success",
+            summary: summarizeToolResult(result),
+          },
+          verification: {
+            status: "verifier_error",
+            reasonCode: "verification_execution_failed",
+            message: detail,
+          },
+          finalResolution: "failed",
+          reasonCode: "verification_execution_failed",
+          reason: detail,
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Independent outcome verification failed after the upstream returned success. " +
+                "Upstream success was not trusted, and the action was resolved as failed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      await this.resolveGovernedAction(
+        actionId,
+        verification.resolution,
+        `delete_file verification (${verification.reasonCode})`,
+      );
+      this.emitOutcomeAuditLog({
+        requestedToolCall: {
+          name: toolName,
+          arguments: requestedToolCall.arguments,
+        },
+        intendedEffect: deleteFileIntent,
+        upstreamReported: {
+          status: "success",
+          summary: summarizeToolResult(result),
+        },
+        verification: {
+          status: verification.status,
+          reasonCode: verification.reasonCode,
+          message: verification.message,
+          changedPaths: verification.changedPaths,
+          unexpectedPaths: verification.unexpectedPaths,
+        },
+        finalResolution: verification.resolution,
+        reasonCode: verification.reasonCode,
+        reason: verification.message,
+      });
+
+      if (verification.resolution === "success") {
+        return result!;
+      }
+
+      if (verification.resolution === "failed") {
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                "Tool call completed but the intended delete effect was not independently observed. " +
+                "Action resolved as failed.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Tool call completed but independent verification detected a policy-violating file effect. " +
+              "Action resolved as malicious.",
+          },
+        ],
+        isError: true,
+      };
+    }
+
     // Legacy post-call verification for other governed filesystem tools.
     if (resolvedPath && this.resolverClient) {
       const artifactExists = fs.existsSync(resolvedPath);
@@ -1131,6 +1323,7 @@ export class FirewallServer {
    * AgentGate payload — raw user input is never passed unsanitized.
    */
   private async handlePreflightRejection(
+    toolName: string,
     session: SessionAuth,
     attemptedPath: string,
   ) {
@@ -1140,6 +1333,7 @@ export class FirewallServer {
       : attemptedPath;
 
     const payload = {
+      toolName,
       attemptedPath: sanitizedPath,
       agentIdentityId: session.identityId,
       agentBondId: session.bondId,
@@ -1152,7 +1346,7 @@ export class FirewallServer {
         this.firewallBondId!,
         "firewall.preflight_rejection",
         payload,
-        getExposure(this.policy!, "write_file"),
+        getExposure(this.policy!, toolName),
       );
 
       await this.resolverClient!.resolveAction(result.actionId, "malicious");

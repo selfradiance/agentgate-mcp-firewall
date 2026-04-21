@@ -11,6 +11,7 @@ import {
 } from "../src/write-file-verifier.js";
 import { startFilesystemWrapper } from "./fixtures/filesystem-server-wrapper.js";
 import { startCompromisedWriteServer } from "./fixtures/compromised-write-server.js";
+import { startDeleteFileServer } from "./fixtures/delete-file-server.js";
 
 let nextPort = 4600;
 
@@ -346,6 +347,421 @@ describe("independent write_file outcome verification", () => {
       await client?.close();
       await firewall.stop();
       await wrapper.stop();
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("independent delete_file outcome verification", () => {
+  it("resolves success only when the requested regular file is deleted with no other governed-path mutation", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "delete-me.txt");
+    fs.writeFileSync(targetPath, "delete me", "utf-8");
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "honest",
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBeUndefined();
+      expect(fs.existsSync(targetPath)).toBe(false);
+      expect(deleteServer.deleteCalls).toEqual([targetPath]);
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "success" },
+      ]);
+
+      const auditLine = logSpy.mock.calls
+        .map((call) => call[0])
+        .find(
+          (value): value is string =>
+            typeof value === "string" &&
+            value.startsWith("FIREWALL_OUTCOME "),
+        );
+
+      expect(auditLine).toBeDefined();
+
+      const audit = JSON.parse(auditLine!.slice("FIREWALL_OUTCOME ".length)) as {
+        requestedToolCall: { name: string };
+        upstreamReported: { status: string };
+        verification: {
+          reasonCode: string;
+          changedPaths: string[];
+          unexpectedPaths: string[];
+        };
+        finalResolution: string;
+      };
+
+      expect(audit.requestedToolCall.name).toBe("delete_file");
+      expect(audit.upstreamReported.status).toBe("success");
+      expect(audit.verification.reasonCode).toBe("verified_target_deleted");
+      expect(audit.verification.changedPaths).toEqual([targetPath]);
+      expect(audit.verification.unexpectedPaths).toEqual([]);
+      expect(audit.finalResolution).toBe("success");
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails before forwarding when the target is missing in pre-state", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "missing.txt");
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "honest",
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(deleteServer.deleteCalls).toEqual([]);
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "failed" },
+      ]);
+
+      const auditLine = logSpy.mock.calls
+        .map((call) => call[0])
+        .find(
+          (value): value is string =>
+            typeof value === "string" &&
+            value.startsWith("FIREWALL_OUTCOME "),
+        );
+
+      expect(auditLine).toBeDefined();
+
+      const audit = JSON.parse(auditLine!.slice("FIREWALL_OUTCOME ".length)) as {
+        upstreamReported: { status: string };
+        verification: { reasonCode: string };
+        finalResolution: string;
+      };
+
+      expect(audit.upstreamReported.status).toBe("not_called");
+      expect(audit.verification.reasonCode).toBe("target_missing_prestate");
+      expect(audit.finalResolution).toBe("failed");
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fails before forwarding when the target exists but is not a regular file", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "dir-target");
+    fs.mkdirSync(targetPath);
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "honest",
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(deleteServer.deleteCalls).toEqual([]);
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "failed" },
+      ]);
+
+      const auditLine = logSpy.mock.calls
+        .map((call) => call[0])
+        .find(
+          (value): value is string =>
+            typeof value === "string" &&
+            value.startsWith("FIREWALL_OUTCOME "),
+        );
+
+      expect(auditLine).toBeDefined();
+
+      const audit = JSON.parse(auditLine!.slice("FIREWALL_OUTCOME ".length)) as {
+        upstreamReported: { status: string };
+        verification: { reasonCode: string };
+        finalResolution: string;
+      };
+
+      expect(audit.upstreamReported.status).toBe("not_called");
+      expect(audit.verification.reasonCode).toBe("target_not_regular_file_prestate");
+      expect(audit.finalResolution).toBe("failed");
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves failed when the upstream claims success but leaves the target unchanged", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "still-here.txt");
+    fs.writeFileSync(targetPath, "still here", "utf-8");
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "noop",
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.readFileSync(targetPath, "utf-8")).toBe("still here");
+      expect(deleteServer.deleteCalls).toEqual([targetPath]);
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "failed" },
+      ]);
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves malicious when another governed path changes during the claimed delete", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "delete-me.txt");
+    const roguePath = path.join(governedRoot, "rogue-delete-output.txt");
+    fs.writeFileSync(targetPath, "delete me", "utf-8");
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "extra_change",
+      extraPath: roguePath,
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.existsSync(targetPath)).toBe(false);
+      expect(fs.readFileSync(roguePath, "utf-8")).toBe("unexpected governed mutation");
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "malicious" },
+      ]);
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
+      fs.rmSync(tempRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves malicious when the target still exists but is mutated instead of deleted", async () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mcp-firewall-v040-"));
+    const governedRootPath = path.join(tempRoot, "governed");
+    fs.mkdirSync(governedRootPath, { recursive: true });
+    const governedRoot = fs.realpathSync(governedRootPath);
+    const targetPath = path.join(governedRoot, "mutated.txt");
+    fs.writeFileSync(targetPath, "before", "utf-8");
+
+    const deleteServer = await startDeleteFileServer(allocatePort(), {
+      governedRoot,
+      mode: "mutate_target",
+      mutatedContent: "after",
+    });
+
+    const resolver = createFakeResolver();
+    const firewallPort = allocatePort();
+    const firewall = new FirewallServer({
+      port: firewallPort,
+      upstreamUrl: deleteServer.url,
+      agentgateClient: createFakeAgentGate() as any,
+      resolverClient: resolver.client as any,
+      firewallBondId: "bond_test",
+      policy: {
+        governed_root: governedRoot,
+        tools: {
+          delete_file: { tier: "high", exposure_cents: 10 },
+        },
+        default_exposure_cents: 10,
+      },
+    });
+
+    let client: Client | undefined;
+
+    try {
+      await firewall.start();
+      client = await createAuthenticatedClient(firewall, firewallPort);
+
+      const result = await client.callTool({
+        name: "delete_file",
+        arguments: { path: targetPath },
+      });
+
+      expect(result.isError).toBe(true);
+      expect(fs.readFileSync(targetPath, "utf-8")).toBe("after");
+      expect(deleteServer.deleteCalls).toEqual([targetPath]);
+      expect(resolver.calls).toEqual([
+        { actionId: "action_1", resolution: "malicious" },
+      ]);
+    } finally {
+      await client?.close();
+      await firewall.stop();
+      await new Promise<void>((resolve, reject) => {
+        deleteServer.server.close((error) => (error ? reject(error) : resolve()));
+      });
       fs.rmSync(tempRoot, { recursive: true, force: true });
     }
   });

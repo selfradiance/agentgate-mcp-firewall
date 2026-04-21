@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "demo:write-file": "tsx demo/flagship-write-file.ts",
+    "demo:delete-file": "tsx demo/flagship-delete-file.ts",
     "test": "vitest run",
     "build": "tsc"
   },
