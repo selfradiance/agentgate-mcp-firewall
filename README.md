@@ -1,20 +1,38 @@
 # MCP Firewall
 
-An MCP governance proxy with AgentGate-backed accountability.
+MCP Firewall is a thin governance proxy that sits between MCP clients and upstream MCP servers. It requires governed/bonded authorization for protected tool calls before forwarding them upstream.
 
-MCP Firewall v0.3.0 makes one narrow claim:
+The current shipped proof is narrow: on two current filesystem proof surfaces, the firewall does not resolve from upstream-reported success alone. It independently verifies the filesystem effect it can observe on disk and resolves from that observed effect.
 
-For `write_file` routed to one upstream filesystem-style MCP server, the firewall does not trust upstream-reported success alone. It independently verifies the postcondition on disk and resolves the action from the observed effect.
+## Current Shipped Proof Surfaces
 
-That means a compromised upstream can claim `"success"` and still be caught when:
+- governed `write_file` on one supported filesystem-style upstream surface
+- governed single-path `delete_file` on one dedicated delete-capable upstream surface used in this repo's tests and delete proof demo
 
-- no file was actually written
-- the wrong governed path was written
-- the target path exists but does not contain the requested content
+Both proof surfaces are intentionally small. They depend on:
 
-This release is intentionally small. It is a proof-of-concept for one independently checkable effect class, not a general proof against all compromised MCP behavior.
+- effects confined to `governed_root`
+- a shared filesystem view between firewall and upstream
+- deterministic postconditions the firewall can check directly
 
-If you want the fastest proof path, jump to [First Run: Flagship Demo](#first-run-flagship-demo) and run `npm run demo:write-file`.
+For the `delete_file` surface, the claim attaches only to the local [`delete-file-test-server`](test/fixtures/delete-file-server.ts) fixture. The pinned reference upstream `@modelcontextprotocol/server-filesystem` still does not expose a native named `delete_file` tool, so the `delete_file` proof does not attach to that upstream.
+
+## What This Repo Proves Today
+
+- a thin governance proxy can sit in front of MCP tool calls and require governed/bonded authorization
+- for these two narrow filesystem effect classes, it can independently verify the observed effect after the upstream returns
+- a compromised upstream can claim `"success"` and still be caught when no effect happened, the wrong governed path changed, or the requested write/delete outcome is wrong
+
+## What This Repo Does Not Prove
+
+- general MCP verification
+- independent verification for all MCP tools, all upstream servers, or all upstream results
+- a general proof against all compromised MCP behavior
+- a claim that every upstream result can be independently verified
+
+> [!IMPORTANT]
+> **Start Here First**
+> The fastest outsider-readable proof path is the [Governed WriteFile Demo](https://github.com/selfradiance/agentgate-governed-writefile-demo). Run that first, then come back here for the implementation details behind this repo's firewall, verifier, policy gate, and audit trail.
 
 ## Quick Explainer
 
@@ -28,7 +46,7 @@ Part 3 covers the governed `write_file` example directly.
 
 An MCP client normally has to trust the upstream MCP server's answer about whether a tool call succeeded. That is not a safe assumption for a governance proxy. If the upstream is compromised or dishonest, it can claim success without producing the intended effect, or it can produce a different effect than the one the client requested.
 
-v0.3.0 proves that the firewall can govern one high-risk surface without trusting that self-report. The chosen surface is `write_file`, because it is easy to verify mechanically and easy to demonstrate honestly.
+The repo's claim remains intentionally small: it shows that the firewall can govern a small set of independently checkable filesystem effects without treating upstream self-report as authoritative. The first shipped proof surface was `write_file`, because it is easy to verify mechanically and easy to demonstrate honestly; the repo now also includes a second narrow `delete_file` proof surface on its dedicated test/demo upstream.
 
 ## v0.3.0 Scope
 
