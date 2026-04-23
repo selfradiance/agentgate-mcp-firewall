@@ -2,12 +2,14 @@
 
 MCP Firewall is a thin governance proxy that sits between MCP clients and upstream MCP servers. It requires governed/bonded authorization for protected tool calls before forwarding them upstream.
 
+In the intended public path, the [Governed WriteFile Demo](https://github.com/selfradiance/agentgate-governed-writefile-demo) is the cold-reader starting point. This repo is the verification layer behind that demo for readers who want implementation depth.
+
 The current shipped proof is narrow: on two current filesystem proof surfaces, the firewall does not resolve from upstream-reported success alone. It independently verifies the filesystem effect it can observe on disk and resolves from that observed effect.
 
 ## Current Shipped Proof Surfaces
 
-- governed `write_file` on one supported filesystem-style upstream surface
-- governed single-path `delete_file` on one dedicated delete-capable upstream surface used in this repo's tests and delete proof demo
+- governed `write_file` on the supported write proof path
+- governed single-path `delete_file` on the dedicated delete-capable upstream fixture/demo path
 
 Both proof surfaces are intentionally small. They depend on:
 
@@ -28,8 +30,9 @@ For these two shipped proof surfaces only, the firewall already performs governe
 
 ## What This Repo Does Not Prove
 
-- general MCP verification
+- general MCP security or general MCP verification
 - independent verification for all MCP tools, all upstream servers, or all upstream results
+- arbitrary tool verification
 - a general proof against all compromised MCP behavior
 - a claim that every upstream result can be independently verified
 
@@ -409,7 +412,7 @@ This section is deliberate. The repo should not claim more than the implementati
 - It watches `governed_root`, not the whole machine. A compromised upstream that writes outside the governed tree is out of scope for this verifier unless that behavior also produces an observable governed-tree violation.
 - It assumes the firewall and upstream share the same filesystem view. If they do not share mounts, verification will fail or become meaningless.
 - It assumes no unrelated concurrent writer is modifying `governed_root` during the governed call. Concurrent writes can create false malicious/failure signals because the verifier uses before/after snapshots.
-- It is not a general attestation framework. There is no cryptographic proof that the upstream executed particular code, only an independent check of one observable effect class.
+- It is not a general attestation system. There is no cryptographic proof that the upstream executed particular code, only an independent check of one observable effect class.
 - It is still a localhost proof-of-concept. Production-grade isolation, supervision, and multi-tenant containment are out of scope here.
 
 ## Related Projects
