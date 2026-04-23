@@ -17,10 +17,13 @@ Both proof surfaces are intentionally small. They depend on:
 
 For the `delete_file` surface, the claim attaches only to the local [`delete-file-test-server`](test/fixtures/delete-file-server.ts) fixture. The pinned reference upstream `@modelcontextprotocol/server-filesystem` still does not expose a native named `delete_file` tool, so the `delete_file` proof does not attach to that upstream.
 
+For these two shipped proof surfaces only, the firewall already performs governed-root before/after snapshot-diff verification in substance. The verifier is not limited to checking whether the requested target exists or whether requested content shows up at the target path. On these proof surfaces it captures a full governed-root snapshot before forwarding, captures a full governed-root snapshot after the upstream returns, diffs the changed governed paths, and treats non-target governed-path mutation as unexpected and `malicious`. On `delete_file`, it also records target pre-state and rejects missing or non-regular targets before forwarding. This still does not justify any broader general MCP verification claim.
+
 ## What This Repo Proves Today
 
 - a thin governance proxy can sit in front of MCP tool calls and require governed/bonded authorization
-- for these two narrow filesystem effect classes, it can independently verify the observed effect after the upstream returns
+- for the shipped `write_file` and `delete_file` proof surfaces only, it resolves from governed-root before/after snapshot-diff verification rather than upstream-reported success alone
+- on those proof surfaces, it verifies the requested target effect and also detects other governed-path mutation
 - a compromised upstream can claim `"success"` and still be caught when no effect happened, the wrong governed path changed, or the requested write/delete outcome is wrong
 
 ## What This Repo Does Not Prove
@@ -48,13 +51,15 @@ An MCP client normally has to trust the upstream MCP server's answer about wheth
 
 The repo's claim remains intentionally small: it shows that the firewall can govern a small set of independently checkable filesystem effects without treating upstream self-report as authoritative. The first shipped proof surface was `write_file`, because it is easy to verify mechanically and easy to demonstrate honestly; the repo now also includes a second narrow `delete_file` proof surface on its dedicated test/demo upstream.
 
-## v0.3.0 Scope
+## Original v0.3.0 Write_File Scope
 
 In scope for this release:
 
-- one upstream MCP server
+- one upstream filesystem-style MCP server
 - one high-risk tool surface: `write_file`
-- one deterministic verifier for filesystem write outcomes
+- effects confined to `governed_root`
+- a shared filesystem view between firewall and upstream
+- one deterministic verifier for observable filesystem write outcomes
 - honest and dishonest upstream test scenarios
 - structured outcome logging that records the basis for each governed decision
 
@@ -66,21 +71,25 @@ Not claimed in this release:
 - coverage for every filesystem tool
 - protection against all possible upstream side effects
 
-## What v0.3.0 Verifies
+## What The Shipped Verifier Checks
 
-For governed `write_file` calls, the firewall records an intended effect and then verifies it after the upstream returns.
+For the shipped `write_file` and `delete_file` proof surfaces, the verifier works from the firewall's own filesystem view. It captures a full governed-root snapshot before forwarding, forwards the request, captures a full governed-root snapshot after the upstream returns, diffs the changed paths, and then evaluates both the requested target effect and any other governed-path mutation it observed.
 
-The intended effect is:
+For governed `write_file` calls, the intended effect is:
 
 - the exact target path should exist as a regular file
-- that file's content hash should match the requested content
+- that file's content hash and byte size should match the requested content
 - no other path inside `governed_root` should have changed during the call
 
-The verifier works from the firewall's own filesystem view. It snapshots the governed tree before the upstream call, forwards the request, snapshots again after the upstream returns, and compares the observed effect with the intended one.
+For governed single-path `delete_file` calls on the dedicated delete fixture in this repo, the intended effect is:
+
+- the exact target path must exist as a regular file before forwarding, or the call is rejected before forward as `failed`
+- that exact target path should be absent after the upstream-reported success
+- no other path inside `governed_root` should have changed during the call
 
 ## Resolution Policy
 
-v0.3.0 uses a simple deterministic mapping:
+The shipped proof surfaces use a simple deterministic mapping:
 
 - verified intended effect present -> `success`
 - claimed success but intended effect not observed -> `failed`
@@ -88,14 +97,16 @@ v0.3.0 uses a simple deterministic mapping:
 
 Concretely:
 
-- target file missing after upstream success -> `failed`
-- target file content mismatch -> `malicious`
-- wrong governed path changed -> `malicious`
+- `write_file`: target file missing after upstream success -> `failed`
+- `write_file`: target file content mismatch -> `malicious`
+- `write_file` or `delete_file`: non-target governed-path mutation -> `malicious`
+- `delete_file`: target missing or non-regular in pre-state -> `failed`
+- `delete_file`: target still present unchanged after upstream success -> `failed`
 - verifier internal failure -> `failed`
 
 The firewall returns the governed outcome and, when AgentGate is configured, resolves the bonded action with the same mapping.
 
-## End-to-End Flow
+## Write_File End-to-End Flow
 
 1. The client sends `write_file` to the firewall.
 2. The firewall verifies AgentGate identity and bond state as usual.
@@ -122,12 +133,12 @@ There is also a focused failure-path test where the verifier itself throws. In t
 
 ## Audit Trail
 
-For each governed `write_file` decision, the firewall emits a structured `FIREWALL_OUTCOME` log entry with:
+For each governed `write_file` and `delete_file` decision on these shipped proof surfaces, the firewall emits a structured `FIREWALL_OUTCOME` log entry with:
 
 - requested tool call
 - intended effect
 - upstream reported status and summary
-- independent verification result
+- independent governed-root snapshot/diff verification result
 - final resolution
 - reason code and reason text
 
@@ -144,7 +155,7 @@ MCP Client
 |      MCP Firewall      |
 | auth, bond gate,       |
 | path validation,       |
-| write_file verifier    |
+| write/delete verifier |
 +------------------------+
    |
    | Streamable HTTP
@@ -159,11 +170,13 @@ MCP Client
 governed_root on disk
 ```
 
-For the honest path in tests and local demos, the upstream is `@modelcontextprotocol/server-filesystem` behind the included HTTP wrapper.
+For the honest `write_file` path in tests and local demos, the upstream is `@modelcontextprotocol/server-filesystem` behind the included HTTP wrapper.
 
-## First Run: Flagship Demo
+## Implementation Demo in This Repo
 
-This is the default path for a newcomer. If you only run one thing in this repo, run this demo.
+If you are new to the project, run the companion [Governed WriteFile Demo](https://github.com/selfradiance/agentgate-governed-writefile-demo) first. It is the shortest outsider-readable proof of the shipped thesis.
+
+Come back here when you want the implementation-level run that exercises this repo directly. If you only run one thing in this repo itself, run this demo.
 
 It is the shortest honest path through the real governed `write_file` flow. It reuses the same happy-path sequence already proven in the filesystem end-to-end test:
 
@@ -240,9 +253,29 @@ The demo script:
 - the demo uses the real signed `authenticate` flow before calling `write_file`
 - the important point is not just that the file exists; it is that the firewall resolved the action from the observed disk effect after the MCP call
 
+### Dedicated `delete_file` Proof Demo
+
+This repo also includes a narrow `delete_file` proof demo for the `v0.4.0` surface:
+
+```bash
+npm run demo:delete-file
+```
+
+If your local AgentGate instance is already configured with `AGENTGATE_REST_KEY`, export the same value before running this command.
+
+That demo does not use `@modelcontextprotocol/server-filesystem`. It starts the dedicated delete-capable fixture upstream in this repo, calls governed single-path `delete_file`, and then checks that:
+
+- the target existed as a regular file before the call
+- the upstream reported success
+- the target is absent after the call
+- no other governed path changed
+- the final resolution is `success`
+
+The saved audit copy lands at `./data/delete-file-demo/last-firewall-outcome.json`.
+
 ## Manual Startup (Optional)
 
-Use this only if you want to start the wrapper and firewall yourself. If you want one clean end-to-end demo, use the Flagship Demo above.
+Use this only if you want to start the wrapper and firewall yourself after you already understand the proof path. For a first read, use the companion demo repo first; for an implementation-level run in this repo, use the demo above.
 
 ### Prerequisites
 
@@ -319,6 +352,12 @@ If you want a working example of that authenticated client flow, run:
 npm run demo:write-file
 ```
 
+For the dedicated `delete_file` proof surface in this repo, run:
+
+```bash
+npm run demo:delete-file
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -346,16 +385,26 @@ The v0.3.0 work adds focused tests for:
 - honest `write_file` verification success
 - upstream lies with no effect
 - upstream lies with wrong-target write
+- extra governed-path deletion during the claimed write
+- governed-path type change during the claimed write
 - verifier failure path
 - deterministic resolution mapping in the standalone verifier
 
+The repo also now includes focused `delete_file` tests on the dedicated delete-capable upstream fixture for:
+
+- honest `delete_file` verification success
+- pre-state ineligibility before forwarding
+- unchanged target after claimed success
+- extra governed-path mutation
+- mutated target instead of delete
+
 Tests that require a local AgentGate instance still skip cleanly when AgentGate is not running.
 
-## What v0.3.0 Still Does Not Solve
+## What The Current Repo Still Does Not Solve
 
 This section is deliberate. The repo should not claim more than the implementation proves.
 
-- It verifies one surface only. The sharp v0.3.0 claim is about `write_file`, not every MCP tool.
+- It verifies exactly two shipped proof surfaces: governed `write_file` on one filesystem-style upstream surface and governed single-path `delete_file` on the dedicated delete fixture used here. That still does not mean every MCP tool, every upstream, or general MCP verification.
 - It verifies observable postconditions, not causality. If the target file already contained the requested content before the call, a dishonest no-op is indistinguishable from a real idempotent write.
 - It watches `governed_root`, not the whole machine. A compromised upstream that writes outside the governed tree is out of scope for this verifier unless that behavior also produces an observable governed-tree violation.
 - It assumes the firewall and upstream share the same filesystem view. If they do not share mounts, verification will fail or become meaningless.
