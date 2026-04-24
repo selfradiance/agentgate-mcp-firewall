@@ -1,6 +1,7 @@
 {
   "name": "agentgate-mcp-firewall",
   "version": "0.4.0",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.ts",
