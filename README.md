@@ -6,6 +6,14 @@ In the intended public path, the [Governed WriteFile Demo](https://github.com/se
 
 The current shipped proof is narrow: on two current filesystem proof surfaces, the firewall does not resolve from upstream-reported success alone. It independently verifies the filesystem effect it can observe on disk and resolves from that observed effect.
 
+## Where This Fits in Enterprise MCP Governance
+
+Centralized MCP portals, access controls, logging, and cost controls are valuable and necessary parts of enterprise MCP governance. They help decide which clients, users, and tools should be allowed to interact, and they make that activity visible to operators.
+
+Access governance is not the same as proof that a tool produced the intended effect. MCP Firewall's shipped claim is narrower: for its supported `write_file` and `delete_file` proof surfaces, it records the intended filesystem effect and independently verifies the observed on-disk outcome before resolving.
+
+This is not general MCP security, not a replacement for enterprise MCP gateways, and not a claim to verify arbitrary tools.
+
 ## Current Shipped Proof Surfaces
 
 - governed `write_file` on the supported write proof path
